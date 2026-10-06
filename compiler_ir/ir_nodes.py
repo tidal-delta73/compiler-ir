@@ -1,23 +1,28 @@
-"""The non-SSA control-flow IR object model.
+"""The control-flow IR object model.
 
 The IR is intentionally tiny and directly traversable::
 
     Module
       Function            (signature, local slots, basic blocks)
-        Block             (ordered instructions plus one terminator)
+        Block             (phi nodes, ordered instructions, one terminator)
+          Phi             (SSA only; one incoming value per predecessor)
           Instruction     (Const / Copy / BinOp / Call, all write a dest)
           Terminator      (Return / Jump / Branch)
 
-Two kinds of value references appear as operands:
+Two flavors of module exist:
 
-* :class:`Temp` -- a numbered temporary produced by an instruction;
-* :class:`Slot` -- a numbered, mutable local storage slot (parameters and
-  ``let`` variables).
+* non-SSA (produced by :func:`lower_module`): value references are
+  :class:`Temp` -- numbered temporaries produced by instructions -- and
+  :class:`Slot`, numbered mutable local storage (parameters and ``let``
+  variables).  Temporaries are mostly single assignment; the sole exception
+  is the result temporary of a short-circuit boolean operation, which is
+  written once on each participating path, as is natural in non-SSA form.
+* SSA (produced by :func:`to_ssa`): every parameter and every instruction
+  result is a unique definition, slots never appear, and control-flow joins
+  carry :class:`Phi` nodes listed before the block's ordinary instructions.
 
-Temporaries are numbered by DFS visitation order and are mostly single
-assignment; the sole exception is the result slot of a short-circuit
-boolean operation, which is written once on each participating path, as
-is natural in non-SSA form.
+Both flavors reuse the same node classes; a module's ``ssa`` flag (and each
+function's) says which one it is.
 """
 from __future__ import annotations
 
@@ -97,6 +102,27 @@ class Call:
 Instruction = Union[Const, Copy, BinOp, Call]
 
 
+@dataclass(eq=False)
+class Phi:
+    """An SSA phi function: merges definitions from predecessor blocks.
+
+    ``entries`` maps a predecessor :class:`Block` to the value that is live
+    on that edge.  Entries are kept sorted by predecessor label whenever a
+    module is emitted by :func:`to_ssa`; only reachable predecessors occur.
+    """
+
+    dest: Temp
+    entries: dict["Block", ValueRef] = field(default_factory=dict)
+
+    @property
+    def op(self) -> str:
+        return "phi"
+
+    @property
+    def type(self) -> str:
+        return self.dest.type
+
+
 @dataclass
 class Return:
     value: Optional[ValueRef]
@@ -129,11 +155,14 @@ class Branch:
 Terminator = Union[Return, Jump, Branch]
 
 
-@dataclass
+@dataclass(eq=False)
 class Block:
     id: int
     instructions: list[Instruction] = field(default_factory=list)
     terminator: Optional[Terminator] = None
+    # SSA only; empty in non-SSA blocks.  Phi nodes precede the ordinary
+    # instructions.
+    phis: list[Phi] = field(default_factory=list)
 
     @property
     def label(self) -> str:
@@ -148,6 +177,9 @@ class Block:
 class Parameter:
     name: str
     slot: Slot
+    # SSA only: the unique parameter definition.  None in non-SSA functions,
+    # where the parameter is read through ``slot``.
+    temp: Optional[Temp] = None
 
 
 @dataclass
@@ -158,6 +190,7 @@ class Function:
     locals: list[Slot]
     blocks: list[Block]
     entry: Block
+    ssa: bool = False
 
     def is_void(self) -> bool:
         return self.ret_type == "void"
@@ -166,3 +199,4 @@ class Function:
 @dataclass
 class Module:
     functions: list[Function]
+    ssa: bool = False

@@ -222,7 +222,10 @@ class _Lowerer:
         cond = self.lower_expr(stmt["cond"], scope)
         body_block = self.new_block()
         exit_block = self.new_block()
-        cond_block.terminator = Branch(cond, body_block, exit_block)
+        # A short-circuit condition terminates ``cond_block`` itself and
+        # delivers its value in a later merge block; attach the loop branch
+        # wherever evaluation actually ends, not blindly to cond_block.
+        self.terminate(Branch(cond, body_block, exit_block))
 
         self.current = body_block
         self.lower_stmts(stmt["body"], _Scope(scope))
@@ -292,16 +295,21 @@ class _Lowerer:
             self.current = block
             if evaluates_rhs:
                 right = self.lower_expr(expr["right"], scope)
-                # Allocate the shared result while visiting the first path;
-                # the second path writes the same temporary (non-SSA).
+                # The right operand may itself branch (nested short
+                # circuit); the copy belongs to whatever block it ends in,
+                # not necessarily to ``block``.
+                end = self.current
                 if result is None:
                     result = self.new_temp(BOOL)
-                self.emit(Copy(result, right))
+                end.instructions.append(Copy(result, right))
+                end.terminator = Jump(merge_block)
+                self.current = None
             else:
                 if result is None:
                     result = self.new_temp(BOOL)
                 self.emit(Const(result, short_value))
-            block.terminator = Jump(merge_block)
+                block.terminator = Jump(merge_block)
+                self.current = None
 
         visit(true_block, rhs_on_true_path)
         visit(false_block, not rhs_on_true_path)
