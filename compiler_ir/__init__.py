@@ -7,6 +7,9 @@ Public entry points
   a traversable non-SSA :class:`Module`.
 * :func:`to_ssa` -- convert a :class:`Module` into a brand new, traversable
   pruned-SSA :class:`Module` without mutating the input.
+* :func:`fold_constants` -- fold known literals and propagate them along
+  SSA definition-use edges into a brand new SSA :class:`Module`, without
+  mutating the input.
 * :func:`eliminate_dead_code` -- remove definitions unreachable from the
   SSA roots (terminator operands and calls) into a brand new SSA
   :class:`Module`, without mutating the input.
@@ -43,6 +46,7 @@ from .ir_nodes import (
 from .lowerer import lower_ir, lower_module
 from .printer import render_module
 from .ssa import to_ssa
+from .fold import fold_constants
 from .dce import eliminate_dead_code
 
 
@@ -57,6 +61,7 @@ __all__ = [
     "lower_ir",
     "lower_module",
     "to_ssa",
+    "fold_constants",
     "eliminate_dead_code",
     "render_module",
     "emit_ir",
