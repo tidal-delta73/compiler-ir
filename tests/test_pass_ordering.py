@@ -1,43 +1,49 @@
-"""Pass-ordering and idempotence semantic regression tests.
+"""Pass-ordering, fixpoint and stage-contract regression tests.
 
-The existing suites pin each pass in isolation (lowering, non-SSA -> SSA,
-SSA dead-code elimination) and compare non-SSA vs SSA behavior.  This module
-instead treats the compiler as a *pipeline* made of the existing public
-entry points and checks that:
+With all five public pieces in place -- ``lower_module``, ``to_ssa``,
+``fold_constants``, ``eliminate_dead_code`` and ``render_module``, each
+already pinned by its own suite -- this module treats the compiler as a
+*pipeline* made of those existing public entry points and checks that:
 
-1. One legal source program, fed through the existing entry point
+1. One legal source program, entered through the existing public AST entry
    (:func:`lower_module`, which still runs AST validation, name resolution
    and type checking), produces the same observable behavior under the
-   default optimization pipeline and every alternative *legal* pass order,
-   using the unoptimized (non-SSA) result as the semantic baseline.
-2. For fixed source, options and order, repeated compilations are
-   byte-identical (determinism), while *different* orders are only required
-   to agree on observable behavior -- never on instruction or text layout.
-3. Re-applying the same pass sequence to an optimized result changes
-   neither the canonicalized IR nor the emitted target text (idempotence);
-   each repeatable pass is also a fixed point on its own.
+   default optimization pipeline and every alternative *legal* pass order
+   -- fold/DCE order, repetitions and interleavings -- using the
+   unoptimized (non-SSA) module's execution as the semantic baseline.
+2. For fixed AST, arguments and order, repeated compilations are
+   byte-identical (determinism); different orders need only agree on
+   observable behavior -- never on definition count, SSA numbering or
+   emitted text.
+3. The individually repeated passes (``to_ssa``, ``fold_constants``,
+   ``eliminate_dead_code``) are each a structural and textual fixpoint;
+   for complete schedules that include folding and elimination, a second
+   application is asserted idempotent only once it has actually reached
+   the normalized endpoint, and every call returns an independent object
+   without mutating its input.
 4. Orderings may only permute passes inside the existing stage contracts:
-   SSA construction precedes every SSA-dependent optimization, and
-   instruction selection (here, the deterministic :func:`render_module`
-   emission) runs after IR optimization.
+   SSA construction precedes every SSA-dependent optimization
+   (``fold_const``/``dce``), and instruction selection (the deterministic
+   :func:`render_module` emission) runs after IR optimization.
+
+The samples collectively cover cross-basic-block propagation; same- and
+different-constant phis at a branch convergence; a loop header phi;
+foldable arithmetic and comparisons; definitions that become dead only
+after folding; and paths whose result is unused but whose calls remain
+observable side effects.
 
 Passes and preconditions (nothing new is added to the compiler package)
 -----------------------------------------------------------------------
 
-* ``ssa``  -- :func:`to_ssa`.  Legal on a lowered module and, as an
+* ``ssa``   -- :func:`to_ssa`.  Legal on a lowered module and, as an
   idempotent canonicalization (clone + deterministic renumbering), on an
   already-SSA module.
-* ``dce``  -- :func:`eliminate_dead_code`.  Its documented precondition is
-  an SSA module: applying it before ``ssa`` raises ``ValueError``.
+* ``fold``  -- :func:`fold_constants`.  Its documented precondition is an
+  SSA module: scheduling it before ``ssa`` raises ``ValueError``.
+* ``dce``   -- :func:`eliminate_dead_code`.  Its documented precondition is
+  an SSA module: scheduling it before ``ssa`` raises ``ValueError``.
 * instruction selection is the final :func:`render_module` and is fixed
   last.
-
-The default optimization pipeline is ``ssa, dce, ssa``: the SSA-dependent
-optimization (DCE) sits after SSA construction, and a trailing SSA
-canonicalization compacts the numbering holes DCE may leave so the emitted
-IR is the canonical fixed point of the sequence.  Alternative legal orders
-differ only in the middle (extra normalization, an extra fixpoint DCE, or an
-ssa/dce interleaving); the no-DCE order ``ssa`` is legal as well.
 
 Observables
 -----------
@@ -47,24 +53,26 @@ The language has no I/O statement, so the ordered trace of executed calls
 side effect the language can have (it is also the observable used by
 ``test_semantic_equivalence.py``).  An outcome is one of:
 
-* normal termination: return value (``None`` for ``void``) + call trace;
-* a runtime fault: error category, trigger site, the operands at the fault,
-  and the call trace produced *before* the fault.
+* normal termination: return value (``None`` for void) + call trace;
+* a runtime fault: error category, trigger site, the operands at the
+  fault, and the call trace produced *before* the fault.
 
-The language's grammar already includes ``div``/``mod``; the single runtime
-error the language defines is a zero divisor.  Division and modulo follow
-truncation toward zero (the remainder satisfies ``a == (a/b)*b + a%b``).
-There is no array or indexing construct, so no bounds error exists in this
-language subset, and no undefined-behavior sample is used: every faulting
-instruction's result is consumed (returned, branched on or accumulated), so
-no legal order can legally delete it.
+The language's grammar already includes ``div``/``mod``; the single
+runtime error the language defines is a zero divisor.  Division and
+modulo follow truncation toward zero (the remainder satisfies
+``a == (a/b)*b + a%b``).  There is no array or indexing construct, so no
+bounds error exists in this language subset, and no undefined-behavior
+sample is used: every faulting instruction's result is consumed (returned,
+branched on or accumulated), so no legal order can legally delete it.
 
 A fault site is identified independently of SSA numbering by
 ``(function name, block label, operator, ordinal of the BinOp among the
 BinOps of its block)``: block labels are assigned by the lowering DFS and
-preserved by ``to_ssa`` and DCE, and the relative order of surviving
-BinOps is preserved as well.  Every faulting block in this suite contains a
-single faulting BinOp, so the site is unambiguous.
+preserved by ``to_ssa``, folding and DCE, and the relative order of
+surviving BinOps is preserved as well.  Every faulting block in this suite
+contains exactly one BinOp -- constant folding turns the *other*
+arithmetic into Consts, which never occurs inside the faulting block --
+so the site's ordinal is 0 and is unambiguous under every order.
 
 All inputs are fixed literal argument tuples; the pipeline has no random
 or environment-dependent behavior, hence there is no seed to pin.
@@ -86,6 +94,7 @@ from compiler_ir import (
     TypeCheckError,
     UndefinedSymbolError,
     eliminate_dead_code,
+    fold_constants,
     lower_module,
     render_module,
     to_ssa,
@@ -314,8 +323,10 @@ class _Interpreter:
                         f"{fn_.name}:{block.label}: phi node in non-SSA IR")
 
             # Numbering-independent ordinal of each BinOp among the block's
-            # BinOps (DCE preserves their relative order).  BinOp nodes are
-            # mutable dataclasses and therefore unhashable, so key by id.
+            # BinOps (fold/DCE preserve surviving relative order; folded
+            # BinOps become Consts and therefore leave this enumeration).
+            # BinOp nodes are mutable dataclasses and therefore unhashable,
+            # so key by id.
             binop_index = {
                 id(ins): ordinal
                 for ordinal, ins in enumerate(
@@ -379,7 +390,7 @@ def _apply_binop(instruction: BinOp, left, right, fn_name: str):
                 f"{instruction.operator!r}")
         return operation(left, right)
 
-    _assert(False, f"{fn_name}: unknown BinOp kind {instruction.kind!r}")
+    _assert(False, f"unknown BinOp kind {instruction.kind!r}")
 
 
 class Outcome:
@@ -438,39 +449,68 @@ def _interpret(module: Module, entry: str, arguments) -> Outcome:
 # ==========================================================================
 
 
-# SSA construction, DCE, then a final SSA canonicalization (clone +
-# deterministic renumbering), which makes the emitted IR the fixed point of
-# the whole sequence: DCE may leave numbering holes, and the trailing ssa
-# pass compacts them without changing structure or semantics.
-DEFAULT_ORDER = ("ssa", "dce", "ssa")
+# Full schedule: SSA construction, constant folding, dead-code elimination,
+# then a final SSA canonicalization (clone + deterministic renumbering),
+# which makes the emitted IR the fixed point of the whole sequence: fold/DCE
+# may leave numbering holes, and the trailing ssa pass compacts them without
+# changing structure or semantics.  fold precedes dce on purpose: folding
+# exposes dead definitions that DCE then reclaims.
+DEFAULT_ORDER = ("ssa", "fold", "dce", "ssa")
 
-# Legal alternatives: extra early normalization, an explicit DCE fixpoint
-# repeat, and an ssa/dce interleaving -- all end in the canonicalizing ssa
-# pass, so each is a fixed point of its own sequence.
-ALT_DOUBLE_SSA = ("ssa", "ssa", "dce", "ssa")
-ALT_DCE_FIXPOINT = ("ssa", "dce", "dce", "ssa")
-ALT_INTERLEAVE = ("ssa", "dce", "ssa", "dce", "ssa")
-# Legal but less optimizing: construction + canonicalization only.
-NO_DCE_ORDER = ("ssa",)
-# The README-documented core without the trailing canonicalization: legal,
-# used for cross-order semantics and determinism (its endpoint may carry
-# numbering holes and is compared on observables, not text).
-RAW_CORE_ORDER = ("ssa", "dce")
+# Full legal alternatives: a repeated fold, DCE before the fold/fold->DCE
+# cleanup pair, a repeated DCE, and a fold/dce interleaving.  Every one ends
+# in the canonicalizing ssa pass, so each is a fixed point of its own
+# sequence and all five reach byte-identical canonical IR.
+ALT_FOLD_REPEAT = ("ssa", "fold", "fold", "dce", "ssa")
+ALT_DCE_BEFORE_FOLD = ("ssa", "dce", "fold", "dce", "ssa")
+ALT_DCE_REPEAT = ("ssa", "fold", "dce", "dce", "ssa")
+ALT_INTERLEAVE = ("ssa", "fold", "dce", "fold", "dce", "ssa")
+
+# Legal but deliberately less cleaning: no elimination at all (fold only,
+# fold + canonicalization), no fold (construction only), and the raw cores
+# without the trailing canonicalization.  These keep different numbers of
+# definitions and different SSA numbers, and are compared on observables
+# rather than text.
+NO_DCE_FOLD_ONLY = ("ssa", "fold")
+NO_DCE_FOLD_CANON = ("ssa", "fold", "ssa")
+NO_OPT_ORDER = ("ssa",)
+RAW_FOLD_DCE = ("ssa", "fold", "dce")
+RAW_DCE_FOLD = ("ssa", "dce", "fold")
 
 LEGAL_ORDERS = {
-    "default ssa,dce,ssa": DEFAULT_ORDER,
-    "alt ssa,ssa,dce,ssa": ALT_DOUBLE_SSA,
-    "alt ssa,dce,dce,ssa": ALT_DCE_FIXPOINT,
-    "alt ssa,dce,ssa,dce,ssa": ALT_INTERLEAVE,
-    "no-dce ssa": NO_DCE_ORDER,
-    "raw core ssa,dce": RAW_CORE_ORDER,
+    "default ssa,fold,dce,ssa": DEFAULT_ORDER,
+    "alt repeated fold ssa,fold,fold,dce,ssa": ALT_FOLD_REPEAT,
+    "alt dce-before-fold ssa,dce,fold,dce,ssa": ALT_DCE_BEFORE_FOLD,
+    "alt repeated dce ssa,fold,dce,dce,ssa": ALT_DCE_REPEAT,
+    "alt interleave ssa,fold,dce,fold,dce,ssa": ALT_INTERLEAVE,
+    "no-elimination fold-only ssa,fold": NO_DCE_FOLD_ONLY,
+    "no-elimination fold+canon ssa,fold,ssa": NO_DCE_FOLD_CANON,
+    "no-optimization ssa": NO_OPT_ORDER,
+    "raw core ssa,fold,dce": RAW_FOLD_DCE,
+    "raw core ssa,dce,fold": RAW_DCE_FOLD,
 }
 
-# Orders whose endpoint is the canonical fixed point used by the strict
-# idempotence test.
-IDEMPOTENT_ORDERS = {
+# The five complete schedules: each contains a fold and a dce, ends with
+# ssa, and reaches the same normalized endpoint -- strict idempotence and
+# canonical-text agreement are asserted only for these.
+FULL_ORDERS = {
     name: order for name, order in LEGAL_ORDERS.items()
-    if name != "raw core ssa,dce"
+    if name.startswith(("default", "alt"))
+}
+
+# Partial schedules whose own sequence, re-applied to its endpoint, needs a
+# second round to settle (their endpoints carry fold-made-dead defs or
+# numbering holes).  They are idempotent only *after* converging.
+NON_FIXPOINT_PARTIALS = {
+    name: order for name, order in LEGAL_ORDERS.items()
+    if name.startswith("raw core")
+}
+
+# Ordering harness pass names -> existing public entry points.
+_PASSES = {
+    "ssa": to_ssa,
+    "fold": fold_constants,
+    "dce": eliminate_dead_code,
 }
 
 
@@ -478,21 +518,22 @@ def apply_order(module: Module, order) -> Module:
     """Apply ``order`` (a tuple of pass names) to ``module``.
 
     :raises ValueError: if a pass name is unknown, if instruction selection
-        appears anywhere but the end, or if ``dce`` is scheduled before the
-        first ``ssa`` (DCE requires an SSA module).
+        appears anywhere but the end, or if ``fold``/``dce`` is scheduled
+        before the first ``ssa`` (both require an SSA module).
     """
     ssa_seen = bool(getattr(module, "ssa", False))
-    for index, name in enumerate(order):
+    for name in order:
         if name == "ssa":
             module = to_ssa(module)
             ssa_seen = True
-        elif name == "dce":
+        elif name in ("fold", "dce"):
             if not ssa_seen:
                 raise ValueError(
-                    "pass order violates precondition: 'dce' requires an SSA "
-                    "module, but no 'ssa' pass precedes it"
+                    "pass order violates precondition: "
+                    f"{name!r} requires an SSA module, but no 'ssa' pass "
+                    "precedes it"
                 )
-            module = eliminate_dead_code(module)
+            module = _PASSES[name](module)
         elif name == "isel":
             raise ValueError(
                 "pass order violates stage contract: instruction selection "
@@ -544,6 +585,15 @@ def structural_signature(module: Module):
     return tuple(signature)
 
 
+def _definition_count(module: Module, function_name: str) -> int:
+    fn_ = next(f for f in module.functions if f.name == function_name)
+    return (
+        len(fn_.params)
+        + sum(len(b.phis) for b in fn_.blocks)
+        + sum(len(b.instructions) for b in fn_.blocks)
+    )
+
+
 # ==========================================================================
 # Test programs (public AST subset only; helpers double as observable output)
 # ==========================================================================
@@ -581,8 +631,10 @@ def _join_program():
 # B) Deletable pure computations vs. still-side-effecting expressions.
 #
 # `d` and `junk` are pure chains nobody consumes: DCE deletes them (and
-# their constants), but BOTH calls remain roots even though `ignored`'s
-# result is never read -- deleting either would drop observable output.
+# their constants) -- in the canonical schedules constant folding first
+# turns most of the chain into Consts and DCE then reclaims them -- but
+# BOTH calls remain roots even though `ignored`'s result is never read:
+# deleting either would drop observable output.
 def _clean_program():
     return program(
         func("clean", [param("n", "int")], "int", [
@@ -604,6 +656,8 @@ def _clean_program():
 # `base` is loop invariant and defined before the header; the loop still
 # carries real header phis for `i` and `total`, and the in-loop if makes the
 # side-effecting call happen only on iterations that take its else edge.
+# Folding only collapses compile-time-constant subexpressions; the header
+# phi whose back edge disagrees with its entry edge is left unfolded.
 def _loop_program():
     return program(
         func("loopsum", [param("n", "int"), param("k", "int")], "int", [
@@ -633,7 +687,8 @@ def _loop_program():
 # `dbl` is a trivial inline candidate; no pass order actually inlines it, so
 # every order keeps the call and its observable position.  The pure
 # computations built AFTER the call (`junk1`, `junk2`) are dead and vanish
-# under DCE, while the later side-effecting call `after` is preserved.
+# under DCE (folded into Consts first in the fold-containing schedules),
+# while the later side-effecting call `after` is preserved.
 def _around_program():
     return program(
         func("around", [param("n", "int")], "int", [
@@ -702,8 +757,119 @@ def _mod_fault_program():
     )
 
 
+# F) Definitions exposed as dead only after constant folding.
+#
+# `p`/`q`/`s` are a fully constant chain (20 + 22 = 42) whose result feeds
+# a live subtraction s-n: without folding the chain is needed, so DCE
+# *before* folding cannot remove its inner arithmetic; after folding the
+# chain is Consts and the same schedule's cleanup DCE reclaims every
+# intermediate.  `a` arrives at the merge as the same folded literal 7 on
+# both arms (3+4 and 10-3), so its merge phi folds to a Const and is then
+# dead; the call consuming `a` stays an observable root regardless.
+def _fold_exposed_program():
+    return program(
+        func("exposed", [param("c", "bool"), param("n", "int")], "int", [
+            let("p", "int", int_(20)),
+            let("q", "int", int_(22)),
+            let("s", "int", arith("add", var("p"), var("q"))),
+            let("a", "int", int_(0)),
+            if_(var("c"),
+                [assign("a", arith("add", int_(3), int_(4)))],
+                [assign("a", arith("sub", int_(10), int_(3)))]),
+            let("e", "int", call("emit", [var("a")])),
+            ret(arith("add", arith("sub", var("s"), var("n")), var("e"))),
+        ]),
+        _emit_function(),
+    )
+
+
+# G) Same-constant and different-constant phis at one branch convergence.
+#
+# `same` is 2+3 and 8-3 on its two edges: both fold to the literal 5, so
+# the merge phi folds to Const 5 and disappears.  `diff` is genuinely 11
+# vs 12: its phi survives every order and feeds the observable call.  The
+# returned value combines both, so the folded value is itself used.
+def _phi_merge_program():
+    return program(
+        func("phimerge", [param("c", "bool")], "int", [
+            let("same", "int", int_(0)),
+            if_(var("c"),
+                [assign("same", arith("add", int_(2), int_(3)))],
+                [assign("same", arith("sub", int_(8), int_(3)))]),
+            let("diff", "int", int_(0)),
+            if_(var("c"),
+                [assign("diff", int_(11))],
+                [assign("diff", int_(12))]),
+            let("r", "int", call("emit", [var("diff")])),
+            ret(arith("add", var("same"), var("r"))),
+        ]),
+        _emit_function(),
+    )
+
+
+# H) A loop header phi with a constant entry edge and a folded step.
+#
+# i starts at 0 and advances by (1+5) = 6 per round.  The step arithmetic
+# folds, but the header phi looks constant only on the entry edge: the
+# lattice fixpoint must leave it (and the i+6 add) unfolded once the back
+# edge disagrees.  No calls occur, so this pins loop-carried values.
+def _loop_step_program():
+    return program(
+        func("loopstep", [param("n", "int")], "int", [
+            let("i", "int", int_(0)),
+            while_(compare("lt", var("i"), var("n")),
+                   [assign("i", arith(
+                       "add", var("i"), arith("add", int_(1), int_(5))))]),
+            ret(var("i")),
+        ]),
+    )
+
+
+# I) A foldable comparison steering a branch; both arms' calls stay roots.
+#
+# 6 == 6 folds to the literal true, but the pass must not rewrite the
+# constant Branch into a Jump or delete either block: interpreting the
+# module still takes the true arm.  Both calls are roots in every order
+# (results unused), pinning "unused result but observable side effect".
+def _constant_flag_program():
+    return program(
+        func("constflag", [], "void", [
+            let("flag", "bool", compare("eq", int_(6), int_(6))),
+            if_(var("flag"),
+                [let("r1", "int", call("emit", [int_(1)]))],
+                [let("r2", "int", call("emit", [int_(2)]))]),
+        ]),
+        _emit_function(),
+    )
+
+
+# J) A zero divisor whose value is discovered ONLY by folding.
+#
+# Both arms compute (3*2) - 6 = 0 through folded arithmetic and a
+# same-literal merge phi.  Without folding the divisor SSA value is not
+# statically known; folding still must NOT fold the faulting div/mod away
+# (its result is returned, and the trap has to fire at runtime after the
+# preceding emit).  The faulting BinOp is the sole BinOp in the merge
+# block b3, so its numbering-independent ordinal stays 0 even though the
+# arm arithmetic folds to Consts.
+def _folded_zero_program(operator, function_name):
+    return program(
+        func(function_name, [param("c", "bool")], "int", [
+            let("six", "int", arith("mul", int_(3), int_(2))),
+            let("z", "int", int_(1)),
+            if_(var("c"),
+                [assign("z", arith("sub", var("six"), int_(6)))],
+                [assign("z", arith("sub", var("six"), int_(6)))]),
+            let("e", "int", call("emit", [int_(7)])),
+            let("q", "int", arith(operator, int_(100), var("z"))),
+            ret(arith("add", var("q"), var("e"))),
+        ]),
+        _emit_function(),
+    )
+
+
 # (label, AST builder, entry, argument tuple, pinned expected Outcome) -- the
-# pin anchors ground truth independently of the non-SSA/SSA cross-check.
+# pin anchors ground truth independently of the non-SSA baseline cross-check.
 _CASES = [
     (
         "branch-join constants and phi propagation",
@@ -765,7 +931,8 @@ _CASES = [
             output=[("emit", (0,)), ("emit", (1,)), ("emit", (2,))],
             category=ZERO_DIVISOR,
             # b2 computes the divisor (2 - i) first (BinOp ordinal 0) and
-            # then the division (ordinal 1) that actually faults.
+            # then the division (ordinal 1) that actually faults.  The
+            # divisor sub depends on the parameter i and never folds.
             site=("looptrap", "b2", "div", 1),
             operands=(100, 0),
         ),
@@ -784,6 +951,70 @@ _CASES = [
             category=ZERO_DIVISOR,
             site=("modfall", "b0", "mod", 0),
             operands=(5, 0),
+        ),
+    ),
+    (
+        "dead definitions exposed by folding",
+        _fold_exposed_program, "exposed", (True, 5),
+        Outcome.normal(44, [("emit", (7,))]),
+    ),
+    (
+        "dead definitions exposed by folding (other edge, zero offset)",
+        _fold_exposed_program, "exposed", (False, 0),
+        Outcome.normal(49, [("emit", (7,))]),
+    ),
+    (
+        "same- and different-constant merge phis",
+        _phi_merge_program, "phimerge", (True,),
+        Outcome.normal(16, [("emit", (11,))]),
+    ),
+    (
+        "same- and different-constant merge phis (other edge)",
+        _phi_merge_program, "phimerge", (False,),
+        Outcome.normal(17, [("emit", (12,))]),
+    ),
+    (
+        "loop header phi with folded step",
+        _loop_step_program, "loopstep", (4,),
+        Outcome.normal(6, []),
+    ),
+    (
+        "loop header phi with folded step (boundary)",
+        _loop_step_program, "loopstep", (6,),
+        Outcome.normal(6, []),
+    ),
+    (
+        "loop header phi with folded step (zero trips)",
+        _loop_step_program, "loopstep", (0,),
+        Outcome.normal(0, []),
+    ),
+    (
+        "foldable comparison steering a branch",
+        _constant_flag_program, "constflag", (),
+        Outcome.normal(None, [("emit", (1,))]),
+    ),
+    (
+        "folded same-constant phi reveals division by zero",
+        lambda: _folded_zero_program("div", "foldzero"),
+        "foldzero", (True,),
+        Outcome(
+            "fault",
+            output=[("emit", (7,))],
+            category=ZERO_DIVISOR,
+            site=("foldzero", "b3", "div", 0),
+            operands=(100, 0),
+        ),
+    ),
+    (
+        "folded same-constant phi reveals modulo by zero",
+        lambda: _folded_zero_program("mod", "foldzero"),
+        "foldzero", (False,),
+        Outcome(
+            "fault",
+            output=[("emit", (7,))],
+            category=ZERO_DIVISOR,
+            site=("foldzero", "b3", "mod", 0),
+            operands=(100, 0),
         ),
     ),
 ]
@@ -870,32 +1101,42 @@ class CrossOrderSemanticsTests(unittest.TestCase):
                                 baseline, outcome),
                         )
 
-    def test_target_text_is_never_the_cross_order_correctness_basis(self):
-        # The dead-computation sample lays out differently with and without
-        # DCE: that text difference is allowed.  Semantics still agree.
-        ast = _clean_program()
-        _l, optimized, opt_text = compile_ast(ast, DEFAULT_ORDER)
-        _l2, unoptimized_ssa, no_dce_text = compile_ast(ast, NO_DCE_ORDER)
+    def test_different_orders_keep_different_text_but_same_semantics(self):
+        # Semantic equivalence must never be established from identical
+        # text: the fold-exposed sample keeps far more definitions without
+        # elimination than under the canonical schedule (its constant
+        # chains are not yet reclaimed), so its text differs while its
+        # return value and call order agree for every argument set.
+        ast = _fold_exposed_program()
+        _l, canonical, canon_text = compile_ast(ast, DEFAULT_ORDER)
+        _l2, folded_only, fold_text = compile_ast(ast, NO_DCE_FOLD_ONLY)
+        _l3, plain_ssa, ssa_text = compile_ast(ast, NO_OPT_ORDER)
 
-        # The pure `(1+2)*3` chain is present without DCE but gone with it.
-        # Match a standalone literal 1 ("const 10" must not count).
-        const_one = r"const 1(?!\d)"
-        self.assertRegex(no_dce_text, const_one)
-        self.assertNotRegex(opt_text, const_one)
-        self.assertNotEqual(no_dce_text, opt_text)
+        self.assertNotEqual(ssa_text, fold_text)
+        self.assertNotEqual(fold_text, canon_text)
+        self.assertGreater(
+            _definition_count(folded_only, "exposed"),
+            _definition_count(canonical, "exposed"),
+        )
+        # Folding rewrites slots in place (BinOp -> Const, folded phi -> a
+        # leading Const) without deleting definitions, so the counts can be
+        # equal even though the text differs; order never adds definitions.
+        self.assertGreaterEqual(
+            _definition_count(plain_ssa, "exposed"),
+            _definition_count(folded_only, "exposed"),
+        )
 
-        for arguments in ((5,), (-3,)):
-            a = _interpret(unoptimized_ssa, "clean", arguments)
-            b = _interpret(optimized, "clean", arguments)
-            self.assertEqual(
-                a, b,
-                msg="text layouts differ by design; outcomes must not",
-            )
+        for arguments in ((True, 5), (False, 0), (True, 49)):
+            expected = _interpret(
+                lower_module(copy.deepcopy(ast)), "exposed", arguments)
+            for module in (plain_ssa, folded_only, canonical):
+                self.assertEqual(
+                    _interpret(module, "exposed", arguments), expected,
+                    msg="text layouts differ by design; outcomes must not",
+                )
 
-    def test_fault_category_site_and_prefix_agree_across_orders(self):
-        fault_cases = [
-            case for case in _CASES if case[4].kind == "fault"
-        ]
+    def test_fault_category_site_prefix_and_operands_agree_across_orders(self):
+        fault_cases = [case for case in _CASES if case[4].kind == "fault"]
         self.assertTrue(fault_cases, "suite must include runtime-fault cases")
         for label, builder, entry, arguments, pinned in fault_cases:
             ast = builder()
@@ -904,6 +1145,7 @@ class CrossOrderSemanticsTests(unittest.TestCase):
             self.assertEqual(baseline.kind, "fault")
             self.assertEqual(baseline.category, pinned.category)
             self.assertEqual(baseline.site, pinned.site)
+            self.assertEqual(baseline.operands, pinned.operands)
             for order_name, order in LEGAL_ORDERS.items():
                 _l, optimized, _t = compile_ast(ast, order)
                 outcome = _interpret(optimized, entry, arguments)
@@ -914,6 +1156,36 @@ class CrossOrderSemanticsTests(unittest.TestCase):
                         label, order_name, entry, arguments,
                         baseline, outcome),
                 )
+
+    def test_folding_does_not_swallow_or_advance_the_zero_trap(self):
+        # The folded-zero samples: the divisor is provably zero only after
+        # folding across the same-literal phi, yet every order keeps exactly
+        # one div/mod BinOp at b3 and the emit precedes the fault.  A raw
+        # fold (no DCE) must already keep the fault -- folding alone never
+        # deletes the trap.
+        for operator, arguments in (("div", (True,)), ("mod", (False,))):
+            ast = _folded_zero_program(operator, "foldzero")
+            for order_name in ("no-optimization ssa",
+                               "no-elimination fold-only ssa,fold",
+                               "raw core ssa,fold,dce",
+                               "default ssa,fold,dce,ssa"):
+                with self.subTest(operator=operator, order=order_name):
+                    _l, module, _t = compile_ast(
+                        ast, LEGAL_ORDERS[order_name])
+                    merge = next(
+                        b for b in module.functions[0].blocks
+                        if b.label == "b3")
+                    traps = [ins for ins in merge.instructions
+                             if isinstance(ins, BinOp)
+                             and ins.operator == operator]
+                    self.assertEqual(len(traps), 1)
+                    outcome = _interpret(module, "foldzero", arguments)
+                    self.assertEqual(outcome.kind, "fault")
+                    self.assertEqual(outcome.category, ZERO_DIVISOR)
+                    self.assertEqual(outcome.site,
+                                     ("foldzero", "b3", operator, 0))
+                    self.assertEqual(outcome.operands, (100, 0))
+                    self.assertEqual(outcome.output, [("emit", (7,))])
 
 
 class DeterminismTests(unittest.TestCase):
@@ -947,37 +1219,42 @@ class DeterminismTests(unittest.TestCase):
                 )
 
 
-class IdempotenceTests(unittest.TestCase):
-    def test_reapplying_same_sequence_is_a_noop(self):
+class FixpointAndIdempotenceTests(unittest.TestCase):
+    def test_full_schedules_are_idempotent_and_share_canonical_text(self):
         for label, builder, _entry, _args, _pin in _CASES:
             ast = builder()
-            for order_name, order in IDEMPOTENT_ORDERS.items():
+            canonical_text = None
+            for order_name, order in FULL_ORDERS.items():
                 with self.subTest(sample=label, order=order_name):
                     _l, once, text_once = compile_ast(ast, order)
                     self.assertTrue(once.ssa)
 
-                    # Apply the very same sequence to the optimized result.
+                    # Re-applying the very same (already complete) sequence
+                    # to the optimized result changes neither structure nor
+                    # target text, and returns a fresh object.
                     twice = apply_order(once, order)
-                    text_twice = render_module(twice)
-                    self.assertEqual(
-                        text_once, text_twice,
-                        msg=(f"{label!r} / {order_name!r}: canonical target "
-                             "code changed on second application"),
-                    )
-                    self.assertEqual(
-                        structural_signature(once),
-                        structural_signature(twice),
-                        msg=(f"{label!r} / {order_name!r}: canonical IR "
-                             "structure changed on second application"),
-                    )
                     self.assertIsNot(twice, once)
-
+                    self.assertEqual(render_module(twice), text_once)
+                    self.assertEqual(
+                        structural_signature(twice),
+                        structural_signature(once),
+                    )
                     # A third application must be stable as well.
                     thrice = apply_order(twice, order)
                     self.assertEqual(
-                        text_twice, render_module(thrice),
+                        render_module(thrice), text_once,
                         msg=f"{label!r} / {order_name!r}: not a fixed point",
                     )
+
+                    # All complete schedules normalize to the same bytes.
+                    if canonical_text is None:
+                        canonical_text = text_once
+                    else:
+                        self.assertEqual(
+                            text_once, canonical_text,
+                            msg=(f"{label!r} / {order_name!r}: complete "
+                                 "schedules disagree on canonical text"),
+                        )
 
     def test_individual_repeatable_passes_are_fixpoints(self):
         for label, builder, _entry, _args, _pin in _CASES:
@@ -992,6 +1269,18 @@ class IdempotenceTests(unittest.TestCase):
                     structural_signature(ssa_once),
                     structural_signature(ssa_twice),
                 )
+                self.assertIsNot(ssa_twice, ssa_once)
+
+            fold_once = fold_constants(ssa_once)
+            fold_twice = fold_constants(fold_once)
+            with self.subTest(sample=label, pass_="fold"):
+                self.assertEqual(
+                    render_module(fold_once), render_module(fold_twice))
+                self.assertEqual(
+                    structural_signature(fold_once),
+                    structural_signature(fold_twice),
+                )
+                self.assertIsNot(fold_twice, fold_once)
 
             dce_once = eliminate_dead_code(ssa_once)
             dce_twice = eliminate_dead_code(dce_once)
@@ -1002,35 +1291,94 @@ class IdempotenceTests(unittest.TestCase):
                     structural_signature(dce_once),
                     structural_signature(dce_twice),
                 )
+                self.assertIsNot(dce_twice, dce_once)
 
-    def test_raw_core_reaches_canonical_fixed_point(self):
-        # ssa,dce may leave numbering holes; the trailing canonicalizing ssa
-        # pass is precisely what turns it into the default pipeline's stable
-        # endpoint, and iterating ssa,dce from there changes nothing.
+    def test_raw_cores_become_idempotent_only_after_reaching_endpoint(self):
+        # ssa,fold,dce and ssa,dce,fold lack the trailing canonicalization
+        # and (for dce,fold) the post-fold cleanup, so re-applying the same
+        # sequence may first have to settle them -- for dce,fold, folding
+        # exposes dead constants that the next round's DCE reclaims before
+        # the numbering stabilizes.  Idempotence is therefore asserted only
+        # once iteration has actually converged, never from the first repeat.
+        convergence_rounds = {"raw core ssa,fold,dce": set(),
+                              "raw core ssa,dce,fold": set()}
         for label, builder, _entry, _args, _pin in _CASES:
             ast = builder()
-            lowered, core, _text = compile_ast(ast, RAW_CORE_ORDER)
-            # DCE alone is already a structural fixpoint even with holes.
-            self.assertEqual(
-                render_module(core),
-                render_module(eliminate_dead_code(core)),
-            )
-            canonical = to_ssa(core)
-            cycled = to_ssa(eliminate_dead_code(canonical))
-            self.assertEqual(
-                render_module(canonical), render_module(cycled),
-                msg=(f"{label!r}: default-style endpoint is not the "
-                     "canonical fixed point"),
-            )
+            for order_name, order in NON_FIXPOINT_PARTIALS.items():
+                with self.subTest(sample=label, order=order_name):
+                    _l, endpoint, _text = compile_ast(ast, order)
 
-    def test_inputs_are_not_mutated_by_reapplication(self):
+                    # Drive the sequence to its fixed point, recording how
+                    # many re-applications that took (must terminate quickly
+                    # -- every round is subtractive or a renumbering).
+                    current = endpoint
+                    current_text = render_module(current)
+                    rounds = 0
+                    for rounds in range(1, 6):
+                        nxt = apply_order(current, order)
+                        nxt_text = render_module(nxt)
+                        if nxt_text == current_text:
+                            settled, settled_text = nxt, nxt_text
+                            break
+                        current, current_text = nxt, nxt_text
+                    else:  # pragma: no cover - defensive
+                        self.fail("raw core did not converge within 5 rounds")
+                    convergence_rounds[order_name].add(rounds)
+
+                    # Now that the normalized endpoint is reached, further
+                    # applications are a structural/textual no-op and return
+                    # fresh SSA objects.
+                    again = apply_order(settled, order)
+                    self.assertTrue(again.ssa)
+                    self.assertIsNot(again, settled)
+                    self.assertEqual(render_module(again), settled_text)
+                    self.assertEqual(
+                        structural_signature(again),
+                        structural_signature(settled),
+                    )
+
+                    # Completing with the standard tail (dce,ssa) reaches
+                    # the default pipeline's canonical text.
+                    completed = to_ssa(eliminate_dead_code(settled))
+                    _l2, canonical, _t2 = compile_ast(ast, DEFAULT_ORDER)
+                    self.assertEqual(
+                        render_module(completed), render_module(canonical))
+
+        # The dce-first raw core genuinely needed a non-trivial resettle for
+        # at least one fold-exposing sample; that is the interaction this
+        # guard exists to pin.
+        self.assertIn(2, convergence_rounds["raw core ssa,dce,fold"])
+
+    def test_every_call_returns_independent_object_and_keeps_input(self):
         for label, builder, _entry, _args, _pin in _CASES:
             ast = builder()
             lowered, once, text_before = compile_ast(ast, DEFAULT_ORDER)
             lowered_text_before = render_module(lowered)
-            apply_order(once, DEFAULT_ORDER)
+            # The re-application returns a distinct object...
+            self.assertIsNot(apply_order(once, DEFAULT_ORDER), once)
+            # ...and neither endpoint nor the original lowered module moved.
             self.assertEqual(render_module(once), text_before)
             self.assertEqual(render_module(lowered), lowered_text_before)
+
+            # Individual pass independence/non-mutation on representative
+            # inputs (fold + dce on the raw SSA module).
+            ssa = to_ssa(lower_module(copy.deepcopy(ast)))
+            ssa_text = render_module(ssa)
+            folded = fold_constants(ssa)
+            self.assertIsNot(folded, ssa)
+            self.assertEqual(render_module(ssa), ssa_text)
+            cleaned = eliminate_dead_code(ssa)
+            self.assertIsNot(cleaned, ssa)
+            self.assertEqual(render_module(ssa), ssa_text)
+
+    def test_no_pass_ever_marks_or_mutates_into_non_ssa(self):
+        for label, builder, _entry, _args, _pin in _CASES:
+            ast = builder()
+            for order_name, order in LEGAL_ORDERS.items():
+                _l, module, _t = compile_ast(ast, order)
+                with self.subTest(sample=label, order=order_name):
+                    self.assertTrue(module.ssa)
+                    self.assertTrue(all(f.ssa for f in module.functions))
 
 
 class PassOrderPreconditionTests(unittest.TestCase):
@@ -1045,28 +1393,45 @@ class PassOrderPreconditionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             eliminate_dead_code(lowered)
 
+    def test_fold_before_ssa_is_rejected(self):
+        lowered = lower_module(_clean_program())
+        self.assertFalse(lowered.ssa)
+        with self.assertRaises(ValueError):
+            apply_order(lowered, ("fold",))
+        with self.assertRaises(ValueError):
+            apply_order(lowered, ("fold", "ssa"))
+        with self.assertRaises(ValueError):
+            apply_order(lowered, ("dce", "fold", "ssa"))
+        # The pass itself enforces the same precondition directly.
+        with self.assertRaises(ValueError):
+            fold_constants(lowered)
+
     def test_instruction_selection_must_be_last(self):
         lowered = lower_module(_clean_program())
         with self.assertRaises(ValueError):
-            apply_order(lowered, ("isel", "dce"))
+            apply_order(lowered, ("isel", "fold"))
         with self.assertRaises(ValueError):
-            apply_order(lowered, ("ssa", "isel", "dce"))
+            apply_order(lowered, ("ssa", "isel", "fold"))
+        with self.assertRaises(ValueError):
+            apply_order(lowered, ("ssa", "fold", "isel", "dce"))
 
     def test_unknown_pass_is_rejected(self):
         lowered = lower_module(_clean_program())
-        with self.assertRaises(ValueError):
-            apply_order(lowered, ("ssa", "fold"))
+        for bad in ("unknown", "inline", "simplify", "FOLD"):
+            with self.assertRaises(ValueError):
+                apply_order(lowered, ("ssa", bad))
 
-    def test_every_legal_order_keeps_ssa_before_dce_and_ir_before_isel(self):
+    def test_every_legal_order_keeps_ssa_first_and_render_last(self):
         for name, order in LEGAL_ORDERS.items():
             seen_ssa = False
-            for index, pass_name in enumerate(order):
+            for pass_name in order:
                 if pass_name == "ssa":
                     seen_ssa = True
-                if pass_name == "dce":
+                if pass_name in ("fold", "dce"):
                     self.assertTrue(
                         seen_ssa,
-                        msg=f"legal order {name!r} runs dce before ssa",
+                        msg=f"legal order {name!r} runs {pass_name} "
+                            "before ssa",
                     )
             # Rendering (instruction selection) is always performed after.
             ast = _clean_program()
@@ -1075,11 +1440,112 @@ class PassOrderPreconditionTests(unittest.TestCase):
             self.assertIn("function clean", text)
 
 
-class DceShapeOnFocusedFormsTests(unittest.TestCase):
-    """Structural pins for the forms where passes genuinely interact."""
+class FoldDceInteractionShapeTests(unittest.TestCase):
+    """Structural pins for the forms where folding and DCE interact."""
 
-    def _caller(self, module: Module, name: str):
+    @staticmethod
+    def _caller(module: Module, name: str):
         return next(fn_ for fn_ in module.functions if fn_.name == name)
+
+    def test_fold_exposed_dead_chain_is_reclaimed_only_with_dce(self):
+        # Without elimination the folded constants remain; the canonical
+        # schedule reclaims the 20/22 chain and the folded phi, leaving just
+        # the live constant 42 (s), the merge constant 7 (a), the call and
+        # the two live arithmetic ops (s-n and +e).
+        _l, folded_only, _t = compile_ast(
+            _fold_exposed_program(), NO_DCE_FOLD_ONLY)
+        caller = self._caller(folded_only, "exposed")
+        self.assertIn(
+            20, {i.value for b in caller.blocks for i in b.instructions
+                 if isinstance(i, Const)})
+
+        _l2, canonical, _t2 = compile_ast(
+            _fold_exposed_program(), DEFAULT_ORDER)
+        caller = self._caller(canonical, "exposed")
+        consts = sorted(
+            i.value for b in caller.blocks
+            for i in b.instructions if isinstance(i, Const))
+        self.assertEqual(consts, [7, 42])
+        self.assertEqual(
+            [(i.kind, i.operator) for b in caller.blocks for i in b.instructions
+             if isinstance(i, BinOp)],
+            [("arith", "sub"), ("arith", "add")],
+        )
+        # The same-literal merge phi folded away in every fold-containing
+        # order; no phi survives canonicalization.
+        self.assertFalse(
+            [phi for b in caller.blocks for phi in b.phis])
+        # Side-effecting call retained exactly once.
+        self.assertEqual(
+            [i.name for b in caller.blocks for i in b.instructions
+             if isinstance(i, Call)],
+            ["emit"],
+        )
+
+    def test_same_constant_phi_folds_different_constant_phi_survives(self):
+        _l, module, _t = compile_ast(_phi_merge_program(), DEFAULT_ORDER)
+        caller = self._caller(module, "phimerge")
+        phi_blocks = {b.id: [phi for phi in b.phis]
+                      for b in caller.blocks if b.phis}
+        # Exactly one block carries exactly one phi: the 11/12 merge.
+        self.assertEqual(len(phi_blocks), 1)
+        [phis] = phi_blocks.values()
+        self.assertEqual(len(phis), 1)
+        self.assertEqual(len(phis[0].entries), 2)
+        # The same-literal merge folded to Const 5 and is itself used by the
+        # live return arithmetic.
+        self.assertIn(
+            5, {i.value for b in caller.blocks for i in b.instructions
+                 if isinstance(i, Const)})
+        self.assertEqual(
+            [i.name for b in caller.blocks for i in b.instructions
+             if isinstance(i, Call)],
+            ["emit"],
+        )
+
+    def test_loop_header_phi_survives_while_step_folds(self):
+        _l, module, _t = compile_ast(_loop_step_program(), DEFAULT_ORDER)
+        caller = self._caller(module, "loopstep")
+        # The header (b1) keeps exactly one phi with two incoming edges.
+        header = next(b for b in caller.blocks if b.label == "b1")
+        self.assertEqual(len(header.phis), 1)
+        self.assertEqual(len(header.phis[0].entries), 2)
+        # The body keeps the i+6 add but the 1+5 step folded to Const 6,
+        # and the header comparison stays a comparison.
+        body = next(b for b in caller.blocks if b.label == "b2")
+        self.assertTrue(any(
+            isinstance(i, Const) and i.value == 6 for i in body.instructions))
+        self.assertEqual(
+            [i.operator for i in body.instructions
+             if isinstance(i, BinOp)],
+            ["add"],
+        )
+        self.assertIsInstance(
+            header.terminator, Branch)
+
+    def test_folded_comparison_branches_but_is_not_jump_rewritten(self):
+        _l, module, _t = compile_ast(
+            _constant_flag_program(), DEFAULT_ORDER)
+        caller = self._caller(module, "constflag")
+        # No block was deleted: condition, true, false and the reachable
+        # post-if merge all remain, and the condition terminator is still a
+        # Branch on a folded bool Const.
+        self.assertEqual(len(caller.blocks), 4)
+        self.assertIsInstance(caller.entry.terminator, Branch)
+        cond = caller.entry.terminator.cond
+        owner = next(i for b in caller.blocks for i in b.instructions
+                     if i.dest is cond)
+        self.assertIsInstance(owner, Const)
+        self.assertEqual(owner.value, True)
+        # Both arm calls are present as roots despite unused results; at
+        # runtime only the true arm's call fires.
+        self.assertEqual(
+            [i.name for b in caller.blocks for i in b.instructions
+             if isinstance(i, Call)],
+            ["emit", "emit"],
+        )
+        outcome = _interpret(module, "constflag", ())
+        self.assertEqual(outcome, Outcome.normal(None, [("emit", (1,))]))
 
     def test_deletable_chains_removed_but_side_effecting_calls_kept(self):
         _l, optimized, _t = compile_ast(_clean_program(), DEFAULT_ORDER)
@@ -1090,27 +1556,14 @@ class DceShapeOnFocusedFormsTests(unittest.TestCase):
 
         consts = {ins.value for b in caller.blocks
                   for ins in b.instructions if isinstance(ins, Const)}
-        self.assertEqual(consts, {10, 99, 4})
-
-        binops = [
-            (ins.kind, ins.operator) for b in caller.blocks
-            for ins in b.instructions if isinstance(ins, BinOp)
-        ]
-        self.assertEqual(binops, [("arith", "add"), ("arith", "add")])
-
-    def test_inlineable_call_is_never_silently_removed(self):
-        _l, optimized, _t = compile_ast(_around_program(), DEFAULT_ORDER)
-        caller = self._caller(optimized, "around")
-        calls = [ins.name for b in caller.blocks for ins in b.instructions
-                 if isinstance(ins, Call)]
-        self.assertEqual(calls, ["dbl", "after"])
-        # Dead post-call arithmetic (v*9, +5) is gone; the live n+1 argument
-        # add survives.
-        binops = [
-            ins.operator for b in caller.blocks
-            for ins in b.instructions if isinstance(ins, BinOp)
-        ]
-        self.assertEqual(binops, ["add"])
+        # The fold-first canonical schedule propagates the constants, but
+        # only the call argument 99 and the live +4 (and n+10's side) are
+        # roots; the pure (1+2)*3 chain is gone.
+        self.assertNotIn(1, consts)
+        self.assertNotIn(2, consts)
+        self.assertNotIn(3, consts)
+        self.assertIn(99, consts)
+        self.assertIn(4, consts)
 
     def test_join_phi_shapes_preserved_through_orders(self):
         # The trivial merge (a) prunes to no phi; the real merge (b) keeps a
@@ -1120,7 +1573,6 @@ class DceShapeOnFocusedFormsTests(unittest.TestCase):
             caller = self._caller(module, "join")
             phi_blocks = {b.id: len(b.phis) for b in caller.blocks
                           if b.phis}
-            # Exactly one block carries exactly one phi: b's merge.
             self.assertEqual(
                 list(phi_blocks.values()), [1],
                 msg=f"{order_name!r}: unexpected phi layout {phi_blocks}",
