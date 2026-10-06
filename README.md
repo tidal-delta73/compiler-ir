@@ -73,6 +73,40 @@ ssa = to_ssa(module)              # new Module; module is left untouched
 print(render_module(ssa))
 ```
 
+## SSA dead-code elimination
+
+`eliminate_dead_code` takes the SSA `Module` produced by `to_ssa` and
+returns a brand new SSA `Module` with dead definitions removed; the input
+is never mutated and shares no mutable functions, blocks, instructions or
+phi containers with the result.
+
+```python
+from compiler_ir import (
+    lower_module, to_ssa, eliminate_dead_code, render_module,
+)
+
+ssa = to_ssa(lower_module(ast))
+optimized = eliminate_dead_code(ssa)
+print(render_module(optimized))
+```
+
+Liveness is traced per function from the operands of every `return` and
+`br`, and from every `call` instruction: a call is kept even when its
+result is unused (the call and its ordering are observable behaviour), and
+its argument definitions stay live with it. `const`, arithmetic and `phi`
+definitions that no def/use chain can reach from those roots are removed,
+including chains referenced only by other dead definitions and closed
+phi-only cycles. Nothing else changes: constants are not folded, branches
+are not rewritten, no blocks are deleted or reordered, terminators and
+the relative order of surviving instructions are preserved, and surviving
+phis keep their predecessor order. SSA numbers are never reassigned, so
+the output may contain id holes. Applying the pass again produces a
+structurally and textually equivalent module.
+
+Passing a non-`Module` raises `TypeError`; passing a non-SSA `Module`
+raises `ValueError`. An empty module, or an SSA module with nothing to
+delete, comes back as an independent copy.
+
 Properties of the result:
 
 * Every parameter and every instruction result is a unique SSA value; all
