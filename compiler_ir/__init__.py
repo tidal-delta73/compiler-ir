@@ -7,6 +7,9 @@ Public entry points
   a traversable non-SSA :class:`Module`.
 * :func:`to_ssa` -- convert a :class:`Module` into a brand new, traversable
   pruned-SSA :class:`Module` without mutating the input.
+* :func:`eliminate_dead_code` -- remove definitions unreachable from the
+  SSA roots (terminator operands and calls) into a brand new SSA
+  :class:`Module`, without mutating the input.
 * :func:`render_module` -- render either flavor of :class:`Module` to
   deterministic text.
 * :func:`emit_ir` -- convenience wrapper combining lowering and rendering.
@@ -40,6 +43,7 @@ from .ir_nodes import (
 from .lowerer import lower_ir, lower_module
 from .printer import render_module
 from .ssa import to_ssa
+from .dce import eliminate_dead_code
 
 
 def emit_ir(ast: dict) -> str:
@@ -53,6 +57,7 @@ __all__ = [
     "lower_ir",
     "lower_module",
     "to_ssa",
+    "eliminate_dead_code",
     "render_module",
     "emit_ir",
     # IR object model

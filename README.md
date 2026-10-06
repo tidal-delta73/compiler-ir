@@ -109,6 +109,43 @@ lines, e.g.:
     return %7
 ```
 
+## SSA dead-code elimination
+
+`eliminate_dead_code` takes the SSA `Module` produced by `to_ssa` and
+returns a brand new SSA `Module` with unreachable definitions removed; the
+input is never mutated and the result shares no mutable function, block,
+instruction or phi container with it. A non-`Module` object raises
+`TypeError`; a non-SSA `Module` raises `ValueError`. The empty module and
+already-minimal modules return independent, equivalent copies.
+
+```python
+from compiler_ir import (
+    lower_module, to_ssa, eliminate_dead_code, render_module,
+)
+
+ssa = to_ssa(lower_module(ast))
+optimized = eliminate_dead_code(ssa)   # new Module; ssa is left untouched
+print(render_module(optimized))
+```
+
+Liveness is traced per function, definition-to-use, from fixed roots:
+
+* every operand of a `return` or `br` terminator;
+* every `call` instruction, even when its result is unused — the call and
+  its position in the instruction stream are observable behavior — which
+  in turn keeps its argument definitions live.
+
+A `const`, `BinOp` or `phi` that cannot reach a root is deleted; chains
+feeding only other dead definitions and closed phi cycles disappear
+together. The pass is purely subtractive: no constants are folded,
+branches rewritten, blocks deleted or control flow reordered. Function
+order, signatures, parameters, return types, block labels and order,
+terminators, the relative order of surviving instructions and the
+predecessor order of surviving phis are all preserved. SSA numbers of
+surviving values are kept (so the output may contain numbering holes), and
+every retained reference resolves inside the output module. Applying the
+pass again changes nothing structurally or textually.
+
 ### AST schema
 
 * Program: `{"functions": [function, ...]}`
