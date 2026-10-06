@@ -195,6 +195,56 @@ labels and order, terminators, phi order, instruction relative order and
 all existing SSA numbers are preserved; repeated calls on the same input
 give a structural and textual fixed point.
 
+## Optimization pipeline
+
+`optimize_module(module, passes=None)` collects the pass orchestration
+into one library entry point. It accepts either the non-SSA `Module`
+returned by `lower_module` or an existing SSA `Module`, and returns a
+brand new SSA `Module` that can be traversed and handed to
+`render_module`; the input is never mutated, no mutable function, block,
+instruction or phi container is reused, and no text is rendered.
+
+```python
+from compiler_ir import lower_module, optimize_module, render_module
+
+lowered = lower_module(ast)
+optimized = optimize_module(lowered)            # ("ssa","fold","dce","ssa")
+again     = optimize_module(optimized)          # idempotent re-application
+print(render_module(optimized))
+
+optimize_module(lowered, ("ssa", "fold"))       # explicit order
+optimize_module(lowered, ())                    # independent copy, non-SSA
+optimize_module(optimized, ("fold", "dce"))     # SSA input may start at fold
+```
+
+With `passes` omitted the schedule is `ssa, fold, dce, ssa`: SSA
+construction, folding, DCE, then a trailing SSA canonicalization that
+renumbers away the definition holes DCE may leave, making the result the
+fixed point of the default sequence. An explicit `passes` is a finite
+sequence of the names `"ssa"`, `"fold"` and `"dce"`, executed in the
+given order; names may repeat (`"ssa"` freely, `"fold"`/`"dce"` whenever
+the SSA stage constraint holds). An empty sequence performs no
+optimization and returns an independent, content-equivalent copy that
+keeps the input's SSA/non-SSA flavor.
+
+All arguments and the whole order are validated before any pass runs:
+
+* `module` that is not a `Module` raises `TypeError`;
+* `passes` given as a string or any non-sequence, or containing a
+  non-string element, raises `TypeError`;
+* an unknown name raises `ValueError` — `render_module` is not an
+  optimizable pass and is reported as unknown;
+* on a non-SSA input, scheduling `fold`/`dce` before the first `ssa`
+  raises `ValueError`. An SSA input may begin directly with `fold` or
+  `dce`; `ssa` re-canonicalizes its numbering.
+
+A rejected call leaves the input module unchanged. Different legal
+orders need not produce the same instruction count, SSA numbering or
+text, but they preserve the program's return value, the order and
+arguments of executed calls, and the location and pre-fault call trace
+of any division/modulo-by-zero trap: no legal optimization deletes a
+side-effecting `call` or advances/swallows a runtime fault.
+
 ### AST schema
 
 * Program: `{"functions": [function, ...]}`
