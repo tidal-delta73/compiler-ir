@@ -18,6 +18,11 @@ Temporaries are numbered by DFS visitation order and are mostly single
 assignment; the sole exception is the result slot of a short-circuit
 boolean operation, which is written once on each participating path, as
 is natural in non-SSA form.
+
+``compiler_ir.ssa.to_ssa`` converts such a module to SSA form.  The SSA
+module reuses the same node classes, but slots are gone (every parameter
+and instruction result is a unique ``Temp`` definition) and each block may
+carry :class:`Phi` nodes, rendered before its ordinary instructions.
 """
 from __future__ import annotations
 
@@ -98,6 +103,23 @@ Instruction = Union[Const, Copy, BinOp, Call]
 
 
 @dataclass
+class Phi:
+    """An SSA phi node, present only in modules produced by ``to_ssa``.
+
+    ``incoming`` holds one ``(predecessor block, value)`` pair per
+    reachable in-edge, ordered by predecessor block id.
+    """
+
+    dest: Temp
+    incoming: list  # list[tuple[Block, ValueRef]]
+    type: str
+
+    @property
+    def op(self) -> str:
+        return "phi"
+
+
+@dataclass
 class Return:
     value: Optional[ValueRef]
 
@@ -134,6 +156,8 @@ class Block:
     id: int
     instructions: list[Instruction] = field(default_factory=list)
     terminator: Optional[Terminator] = None
+    # SSA only: phi nodes, ordered before the ordinary instructions.
+    phis: list[Phi] = field(default_factory=list)
 
     @property
     def label(self) -> str:

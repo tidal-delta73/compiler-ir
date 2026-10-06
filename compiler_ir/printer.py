@@ -39,6 +39,13 @@ def _render_instruction(ins) -> str:
     raise AssertionError(f"unknown instruction: {ins!r}")  # pragma: no cover
 
 
+def _render_phi(phi) -> str:
+    incoming = ", ".join(
+        f"{block.label}: {_value(value)}" for block, value in phi.incoming
+    )
+    return f"    {phi.dest}: {phi.dest.type} = phi [{incoming}]"
+
+
 def _render_terminator(term) -> str:
     if isinstance(term, Return):
         if term.value is None:
@@ -63,6 +70,8 @@ def _render_function(func: Function) -> str:
             lines.append(f"    {slot}: {slot.type}")
     for block in func.blocks:
         lines.append(f"  {block.label}:")
+        for phi in block.phis:
+            lines.append(_render_phi(phi))
         for ins in block.instructions:
             lines.append(_render_instruction(ins))
         lines.append(_render_terminator(block.terminator))

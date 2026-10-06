@@ -5,8 +5,9 @@ Public entry points
 * :func:`lower_ir` / :func:`lower_module` -- accept a program AST made of
   plain dicts and lists, run name resolution and type checking, and return
   a traversable :class:`Module`.
+* :func:`to_ssa` -- convert a lowered ``Module`` to a new SSA ``Module``.
 * :func:`render_module` -- render a :class:`Module` to deterministic text.
-* :func:`emit_ir` -- convenience wrapper combining the two.
+* :func:`emit_ir` -- convenience wrapper combining lowering and rendering.
 """
 __version__ = "0.1.0"
 
@@ -29,12 +30,14 @@ from .ir_nodes import (
     Jump,
     Module,
     Parameter,
+    Phi,
     Return,
     Slot,
     Temp,
 )
 from .lowerer import lower_ir, lower_module
 from .printer import render_module
+from .ssa import to_ssa
 
 
 def emit_ir(ast: dict) -> str:
@@ -47,6 +50,7 @@ __all__ = [
     # entry points
     "lower_ir",
     "lower_module",
+    "to_ssa",
     "render_module",
     "emit_ir",
     # IR object model
@@ -60,6 +64,7 @@ __all__ = [
     "Copy",
     "BinOp",
     "Call",
+    "Phi",
     "Return",
     "Jump",
     "Branch",

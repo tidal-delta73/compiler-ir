@@ -107,6 +107,47 @@ Numbers are assigned in function order and statement/expression
 depth-first order — never from dict key order, object identity or set
 iteration — so a given AST produces byte-identical text across processes.
 
+## Non-SSA IR → SSA IR
+
+`to_ssa` takes the `Module` returned by `lower_module` and returns a *new*
+`Module` in static single-assignment form; the input module is left
+unchanged. Anything that is not a `Module` raises `TypeError`.
+
+```python
+from compiler_ir import lower_module, render_module, to_ssa
+
+module = lower_module(ast)      # non-SSA Module
+ssa = to_ssa(module)            # new SSA Module; module is untouched
+print(render_module(ssa))       # renders phi nodes ahead of instructions
+```
+
+In the SSA module:
+
+* Every parameter and instruction result is a unique SSA definition; all
+  slot (`%vN`) reads and writes are gone — a slot write becomes pure
+  renaming, a slot read becomes the value currently reaching it. The
+  multi-path writes produced by short-circuit `and`/`or` are split into
+  one definition per path plus a phi at the merge.
+* A `Phi` appears at a control-flow join only when a value with several
+  reachable definitions is actually observed afterwards. Phis sit ahead of
+  the block's ordinary instructions and record one `(predecessor, value)`
+  pair per reachable in-edge, ordered by predecessor block label:
+  `%t4: int = phi [b1: %t2, b2: %t3]`. Unreachable predecessors never
+  contribute an edge, and phis whose in-edges all carry the same value —
+  or whose result is never used — are removed.
+* Loop-carried variables get a phi at the loop header that takes the
+  entering value from before the loop and the updated value from the
+  back edge.
+* Function order, block labels, block order and terminators are preserved;
+  calls, arithmetic, comparisons, branch targets, returns and side-effect
+  order are equivalent to the input module.
+
+SSA value numbers are assigned per function from zero and are a pure
+function of parameter order, block order and intra-block phi/instruction
+order, so converting and rendering the same input twice is byte-identical,
+and applying `to_ssa` to an already-SSA module is a fixed point (no new
+phis, no renumbering).
+
 ## Tests
 
 ```bash
