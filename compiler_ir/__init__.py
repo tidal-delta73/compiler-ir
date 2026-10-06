@@ -15,6 +15,9 @@ Public entry points
   phis into a brand new SSA :class:`Module`, without mutating the input.
 * :func:`render_module` -- render either flavor of :class:`Module` to
   deterministic text.
+* :func:`optimize_module` -- run a whole optimization pass sequence
+  (default: ``ssa, fold, dce, ssa``) in one call, returning a brand new
+  :class:`Module`.
 * :func:`emit_ir` -- convenience wrapper combining lowering and rendering.
 """
 __version__ = "0.1.0"
@@ -48,6 +51,7 @@ from .printer import render_module
 from .ssa import to_ssa
 from .dce import eliminate_dead_code
 from .folding import fold_constants
+from .optimize import DEFAULT_PASSES, optimize_module
 
 
 def emit_ir(ast: dict) -> str:
@@ -63,6 +67,8 @@ __all__ = [
     "to_ssa",
     "eliminate_dead_code",
     "fold_constants",
+    "optimize_module",
+    "DEFAULT_PASSES",
     "render_module",
     "emit_ir",
     # IR object model
