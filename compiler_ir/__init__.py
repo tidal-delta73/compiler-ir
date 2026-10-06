@@ -10,6 +10,9 @@ Public entry points
 * :func:`eliminate_dead_code` -- remove definitions unreachable from the
   SSA roots (terminator operands and calls) into a brand new SSA
   :class:`Module`, without mutating the input.
+* :func:`fold_constants` -- propagate known literals along SSA def-use
+  chains and fold constant arithmetic/comparison BinOps and same-literal
+  phis into a brand new SSA :class:`Module`, without mutating the input.
 * :func:`render_module` -- render either flavor of :class:`Module` to
   deterministic text.
 * :func:`emit_ir` -- convenience wrapper combining lowering and rendering.
@@ -44,6 +47,7 @@ from .lowerer import lower_ir, lower_module
 from .printer import render_module
 from .ssa import to_ssa
 from .dce import eliminate_dead_code
+from .folding import fold_constants
 
 
 def emit_ir(ast: dict) -> str:
@@ -58,6 +62,7 @@ __all__ = [
     "lower_module",
     "to_ssa",
     "eliminate_dead_code",
+    "fold_constants",
     "render_module",
     "emit_ir",
     # IR object model

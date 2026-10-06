@@ -146,6 +146,55 @@ surviving values are kept (so the output may contain numbering holes), and
 every retained reference resolves inside the output module. Applying the
 pass again changes nothing structurally or textually.
 
+## SSA constant folding and propagation
+
+`fold_constants` takes the SSA `Module` produced by `to_ssa` and returns a
+brand new SSA `Module` in which known literals are propagated along the
+SSA def-use chains; the input is never mutated and the result shares no
+mutable function, block, instruction or phi container with it. A
+non-`Module` object raises `TypeError`; a non-SSA `Module` raises
+`ValueError`. The empty module and modules without foldable definitions
+return independent, content-equivalent copies.
+
+```python
+from compiler_ir import (
+    lower_module, to_ssa, fold_constants,
+    eliminate_dead_code, render_module,
+)
+
+ssa = to_ssa(lower_module(ast))
+folded = fold_constants(ssa)          # new Module; ssa is left untouched
+# Folded definitions that lost their uses (and their operands) are then
+# reclaimed by DCE; fold_constants itself never deletes a definition.
+optimized = eliminate_dead_code(folded)
+print(render_module(optimized))
+```
+
+A value is *known* when it is statically a fixed literal:
+
+* a `const` is known directly, and an arithmetic (`add`, `sub`, `mul`,
+  `div`, `mod`) or comparison (`eq`, `ne`, `lt`, `le`, `gt`, `ge`)
+  `BinOp` folds only when both operands are known, with the folded result
+  available to later definitions;
+* a `phi` folds exactly when every reachable predecessor carries a known
+  literal and all of them are identical — it becomes a `const` in the
+  phi's own value slot;
+* integer division truncates toward zero and the remainder satisfies
+  `a == div(a,b) * b + mod(a,b)`; a known zero divisor is **not** folded,
+  so the runtime trap and its position are neither advanced nor swallowed;
+* a `call` result is always unknown and the call instruction plus its
+  relative order are untouched.
+
+Literals are tracked in a monotone unknown/constant/non-constant lattice
+solved to a fixpoint, so a loop header phi that looks constant on its
+entry edge is correctly left unfolded once the (folded) back edge
+disagrees. The pass neither deletes blocks nor turns a constant `br` into
+a `jump`, and it leaves fold-made-dead definitions behind for
+`eliminate_dead_code`. Function order, signatures, parameters, block
+labels and order, terminators, phi order, instruction relative order and
+all existing SSA numbers are preserved; repeated calls on the same input
+give a structural and textual fixed point.
+
 ### AST schema
 
 * Program: `{"functions": [function, ...]}`
