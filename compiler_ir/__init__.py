@@ -13,10 +13,14 @@ Public entry points
 * :func:`fold_constants` -- propagate known literals along SSA def-use
   chains and fold constant arithmetic/comparison BinOps and same-literal
   phis into a brand new SSA :class:`Module`, without mutating the input.
+* :func:`hoist_loop_invariants` -- move safe loop-invariant definitions
+  out of the natural loops that recompute them into a brand new SSA
+  :class:`Module`, without mutating the input.
 * :func:`optimize_module` -- library-level driver running an ordered
-  schedule of ``to_ssa`` / ``fold_constants`` / ``eliminate_dead_code``
-  (default ``ssa, fold, dce, ssa``) into a brand new SSA
-  :class:`Module`, without mutating the input or rendering text.
+  schedule of ``to_ssa`` / ``fold_constants`` / ``hoist_loop_invariants``
+  / ``eliminate_dead_code`` (default ``ssa, fold, licm, dce, ssa``) into
+  a brand new SSA :class:`Module`, without mutating the input or
+  rendering text.
 * :func:`render_module` -- render either flavor of :class:`Module` to
   deterministic text.
 * :func:`emit_ir` -- convenience wrapper combining lowering and rendering.
@@ -52,6 +56,7 @@ from .printer import render_module
 from .ssa import to_ssa
 from .dce import eliminate_dead_code
 from .folding import fold_constants
+from .licm import hoist_loop_invariants
 from .pipeline import optimize_module
 
 
@@ -68,6 +73,7 @@ __all__ = [
     "to_ssa",
     "eliminate_dead_code",
     "fold_constants",
+    "hoist_loop_invariants",
     "optimize_module",
     "render_module",
     "emit_ir",

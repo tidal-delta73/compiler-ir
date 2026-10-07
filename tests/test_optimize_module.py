@@ -29,6 +29,7 @@ from compiler_ir import (
     eliminate_dead_code,
     emit_ir,
     fold_constants,
+    hoist_loop_invariants,
     lower_module,
     optimize_module,
     render_module,
@@ -51,31 +52,35 @@ from test_dce import _container_objects
 # Explicit schedules exercised from a *non-SSA* input.
 NON_SSA_ORDERS = [
     DEFAULT_ORDER,
-    ("ssa", "fold", "fold", "dce", "ssa"),
-    ("ssa", "fold", "dce", "dce", "ssa"),
-    ("ssa", "dce", "fold", "dce", "ssa"),
-    ("ssa", "fold", "dce", "fold", "dce", "ssa"),
+    ("ssa", "fold", "fold", "licm", "dce", "ssa"),
+    ("ssa", "fold", "licm", "dce", "dce", "ssa"),
+    ("ssa", "fold", "licm", "licm", "dce", "ssa"),
+    ("ssa", "dce", "fold", "licm", "dce", "ssa"),
+    ("ssa", "fold", "dce", "licm", "fold", "dce", "ssa"),
     ("ssa",),
     ("ssa", "fold"),
+    ("ssa", "licm"),
     ("ssa", "dce"),
-    ("ssa", "fold", "dce"),
-    ("ssa", "dce", "fold"),
-    ("ssa", "ssa", "fold", "dce", "ssa"),
-    ("ssa", "fold", "ssa", "dce", "ssa"),
+    ("ssa", "fold", "licm", "dce"),
+    ("ssa", "licm", "fold"),
+    ("ssa", "ssa", "fold", "licm", "dce", "ssa"),
+    ("ssa", "fold", "ssa", "licm", "dce", "ssa"),
 ]
 
-# Schedules exercised from an already-SSA input: fold/dce may lead, ssa may
-# re-canonicalize, names may repeat.
+# Schedules exercised from an already-SSA input: fold/licm/dce may lead,
+# ssa may re-canonicalize, names may repeat.
 SSA_ORDERS = [
     None,
-    ("fold", "dce", "ssa"),
+    ("fold", "licm", "dce", "ssa"),
     ("fold",),
+    ("licm",),
     ("dce",),
     ("ssa",),
-    ("dce", "fold", "dce", "ssa"),
+    ("dce", "fold", "licm", "dce", "ssa"),
     ("fold", "fold", "dce"),
+    ("licm", "licm"),
     ("dce", "dce"),
-    ("ssa", "fold", "dce", "ssa"),
+    ("ssa", "fold", "licm", "dce", "ssa"),
     (),
 ]
 
@@ -147,18 +152,21 @@ class OptimizeValidationTests(unittest.TestCase):
             optimize_module(self.lowered, ("ssa", "fold", "dce",
                                            "render_module"))
 
-    def test_fold_dce_before_ssa_rejected_on_non_ssa_input(self):
-        for order in (("fold",), ("dce",),
-                      ("fold", "ssa"), ("dce", "fold", "ssa"),
-                      ("fold", "dce"), ("dce", "dce"),
-                      ("fold", "dce", "ssa")):
+    def test_fold_licm_dce_before_ssa_rejected_on_non_ssa_input(self):
+        for order in (("fold",), ("dce",), ("licm",),
+                      ("fold", "ssa"), ("licm", "ssa"),
+                      ("dce", "fold", "licm", "ssa"),
+                      ("fold", "dce"), ("licm", "dce"),
+                      ("dce", "dce"),
+                      ("fold", "licm", "dce", "ssa")):
             with self.subTest(order=order):
                 with self.assertRaises(ValueError):
                     optimize_module(self.lowered, order)
 
-    def test_ssa_input_may_start_with_fold_or_dce(self):
-        for order in (("fold",), ("dce",), ("fold", "dce", "ssa"),
-                      ("dce", "fold"), ()):
+    def test_ssa_input_may_start_with_fold_licm_or_dce(self):
+        for order in (("fold",), ("licm",), ("dce",),
+                      ("fold", "licm", "dce", "ssa"),
+                      ("licm", "fold"), ("dce", "licm"), ()):
             with self.subTest(order=order):
                 optimize_module(self.ssa, order)  # must not raise
         self.assert_unchanged()
@@ -167,7 +175,8 @@ class OptimizeValidationTests(unittest.TestCase):
         # A bad final entry must be caught before any earlier valid pass
         # runs as a side effect.
         with self.assertRaises(ValueError):
-            optimize_module(self.lowered, ("ssa", "fold", "dce", "bogus"))
+            optimize_module(
+                self.lowered, ("ssa", "fold", "licm", "dce", "bogus"))
         self.assert_unchanged()
 
     # -- input integrity on failure ----------------------------------------
@@ -292,7 +301,8 @@ class OptimizeOrchestrationTests(unittest.TestCase):
             lowered = _lowered(builder)
             driven = optimize_module(lowered)
             manual = to_ssa(
-                eliminate_dead_code(fold_constants(to_ssa(lowered))))
+                eliminate_dead_code(
+                    hoist_loop_invariants(fold_constants(to_ssa(lowered)))))
             with self.subTest(builder=builder.__name__):
                 self.assertEqual(render_module(driven), render_module(manual))
                 self.assertEqual(
@@ -308,12 +318,16 @@ class OptimizeOrchestrationTests(unittest.TestCase):
 
     def test_repeated_names_run_in_order(self):
         lowered = _lowered(_clean_program)
-        # fold is a fixed point: repeating it must not change the endpoint
-        # versus the same schedule without the repeat.
-        once = optimize_module(lowered, ("ssa", "fold", "dce", "ssa"))
-        twice = optimize_module(
-            lowered, ("ssa", "fold", "fold", "dce", "ssa"))
-        self.assertEqual(render_module(once), render_module(twice))
+        # fold and licm are fixed points: repeating either must not change
+        # the endpoint versus the same schedule without the repeat.
+        once = optimize_module(
+            lowered, ("ssa", "fold", "licm", "dce", "ssa"))
+        twice_fold = optimize_module(
+            lowered, ("ssa", "fold", "fold", "licm", "dce", "ssa"))
+        twice_licm = optimize_module(
+            lowered, ("ssa", "fold", "licm", "licm", "dce", "ssa"))
+        self.assertEqual(render_module(once), render_module(twice_fold))
+        self.assertEqual(render_module(once), render_module(twice_licm))
 
     def test_result_is_traversable_and_renderable_but_text_not_rendered(self):
         lowered = _lowered(_clean_program)
