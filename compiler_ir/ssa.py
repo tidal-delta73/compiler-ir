@@ -9,8 +9,10 @@ phi nodes, unchanged numbering), and any non-:class:`Module` object raises
 
 Algorithm (Cytron et al., with pruning)
 --------------------------------------
-1. Compute reachable blocks, predecessors and the dominator tree from the
-   CFG induced by the terminators.
+1. The shared internal control-flow analysis layer
+   (:func:`compiler_ir.cfg.analyze_function`) supplies reachable blocks,
+   reachable-only predecessors, reverse postorder, the dominator tree and
+   dominance frontiers from the CFG induced by the terminators.
 2. Every value definition site (a parameter slot, a slot copy, or a
    possibly multi-written temporary such as a short-circuit result) gets a
    phi at its iterated dominance frontier.
@@ -26,6 +28,7 @@ Algorithm (Cytron et al., with pruning)
    repeated conversion of the same module is byte-identical and independent
    of set or dict iteration order and object identity.
 """
+from .cfg import analyze_function
 from .ir_nodes import (
     BinOp,
     Block,
@@ -60,123 +63,6 @@ def to_ssa(module: Module) -> Module:
     return Module(
         [_Converter(func).convert() for func in module.functions], ssa=True
     )
-
-
-# --------------------------------------------------------------------------
-# CFG analysis
-# --------------------------------------------------------------------------
-
-
-def _terminator_edges(block: Block):
-    """Return the successor blocks of a block in fixed edge order."""
-    term = block.terminator
-    if isinstance(term, Jump):
-        return [term.target]
-    if isinstance(term, Branch):
-        return [term.true_target, term.false_target]
-    return []
-
-
-class _CFG:
-    def __init__(self, func: Function):
-        self.blocks = list(func.blocks)
-        self.index = {block: i for i, block in enumerate(self.blocks)}
-        self.succs: dict[Block, list[Block]] = {
-            block: _terminator_edges(block) for block in self.blocks
-        }
-        self.reachable = self._reachable_set(func.entry)
-        self.preds: dict[Block, list[Block]] = {
-            block: [] for block in self.blocks
-        }
-        for block in self.blocks:
-            if block not in self.reachable:
-                continue
-            for target in self.succs[block]:
-                if target in self.reachable:
-                    self.preds[target].append(block)
-
-    def _reachable_set(self, entry: Block) -> set[Block]:
-        seen = {entry}
-        stack = [entry]
-        while stack:
-            block = stack.pop()
-            for target in self.succs[block]:
-                if target not in seen:
-                    seen.add(target)
-                    stack.append(target)
-        return seen
-
-    def sort(self, blocks) -> list[Block]:
-        """Sort an iterable of blocks by deterministic block index."""
-        return sorted(blocks, key=lambda b: self.index[b])
-
-
-def _reverse_postorder(cfg: _CFG, entry: Block) -> list[Block]:
-    order: list[Block] = []
-    visited = {entry}
-    stack = [(entry, 0)]
-    while stack:
-        block, pos = stack[-1]
-        successors = cfg.succs[block]
-        if pos < len(successors):
-            stack[-1] = (block, pos + 1)
-            target = successors[pos]
-            if target in cfg.reachable and target not in visited:
-                visited.add(target)
-                stack.append((target, 0))
-        else:
-            order.append(block)
-            stack.pop()
-    order.reverse()
-    return order
-
-
-def _dominators(cfg: _CFG, entry: Block) -> dict[Block, Block]:
-    """Immediate dominators (Cooper-Harvey-Waterman iterative fix point)."""
-    rpo = _reverse_postorder(cfg, entry)
-    rpo_index = {block: i for i, block in enumerate(rpo)}
-    preds_order = {
-        block: cfg.sort(p for p in cfg.preds[block] if p in rpo_index)
-        for block in rpo
-    }
-
-    def intersect(a: Block, b: Block) -> Block:
-        while a is not b:
-            while rpo_index[a] > rpo_index[b]:
-                a = idom[a]
-            while rpo_index[b] > rpo_index[a]:
-                b = idom[b]
-        return a
-
-    idom: dict[Block, Block] = {entry: entry}
-    changed = True
-    while changed:
-        changed = False
-        for block in rpo[1:]:
-            new_idom = next(p for p in preds_order[block] if p in idom)
-            for pred in preds_order[block]:
-                if pred is new_idom or pred not in idom:
-                    continue
-                new_idom = intersect(pred, new_idom)
-            if idom.get(block) is not new_idom:
-                idom[block] = new_idom
-                changed = True
-    return idom
-
-
-def _dominance_frontiers(cfg: _CFG, idom) -> dict[Block, list[Block]]:
-    frontiers: dict[Block, set[Block]] = {
-        block: set() for block in cfg.reachable
-    }
-    for block in cfg.sort(cfg.reachable):
-        if len(cfg.preds[block]) < 2:
-            continue
-        for pred in cfg.preds[block]:
-            runner = pred
-            while runner is not idom[block]:
-                frontiers[runner].add(block)
-                runner = idom[runner]
-    return {block: cfg.sort(nodes) for block, nodes in frontiers.items()}
 
 
 # --------------------------------------------------------------------------
@@ -227,7 +113,7 @@ def _map_term_operands(term, fn) -> None:
 class _Converter:
     def __init__(self, func: Function):
         self.func = func
-        self.cfg = _CFG(func)
+        self.flow = analyze_function(func)
         self._fresh_counter = 0
 
     def fresh(self, typ: str) -> Temp:
@@ -236,13 +122,15 @@ class _Converter:
         return temp
 
     def convert(self) -> Function:
-        cfg = self.cfg
+        flow = self.flow
+        blocks = flow.blocks
+        reachable = flow.reachable
         entry = self.func.entry
-        idom = _dominators(cfg, entry)
-        frontiers = _dominance_frontiers(cfg, idom)
+        idom = flow.idom
+        frontiers = flow.frontiers
 
-        new_blocks = [Block(block.id) for block in cfg.blocks]
-        block_map = dict(zip(cfg.blocks, new_blocks))
+        new_blocks = [Block(block.id) for block in blocks]
+        block_map = dict(zip(blocks, new_blocks))
 
         # -- definition sites, in original DFS definition order ----------
         param_temp: dict = {}
@@ -259,8 +147,8 @@ class _Converter:
             param_temp[param.slot] = temp
             register(param.slot, entry)
 
-        for block in cfg.blocks:
-            if block not in cfg.reachable:
+        for block in blocks:
+            if block not in reachable:
                 continue
             for ins in block.instructions:
                 register(ins.dest, block)
@@ -269,7 +157,7 @@ class _Converter:
         phi_origin: dict[Phi, object] = {}
         block_phis: dict[Block, list[Phi]] = {}
         already: dict[Block, set[object]] = {
-            block: set() for block in cfg.reachable
+            block: set() for block in reachable
         }
         for ref in sorted(ref_order, key=lambda r: ref_order[r]):
             worklist = list(defs[ref])
@@ -293,14 +181,10 @@ class _Converter:
             slot: [temp] for slot, temp in param_temp.items()
         }
 
-        children: dict[Block, list[Block]] = {
-            block: [] for block in cfg.reachable
-        }
-        for block in cfg.sort(cfg.reachable):
-            if block is not entry:
-                children[idom[block]].append(block)
-        for child_list in children.values():
-            child_list.sort(key=lambda b: cfg.index[b])
+        # Dominator-tree children come straight from the flow analysis:
+        # each non-entry reachable block is listed under its immediate
+        # dominator, with sibling order fixed by function block position.
+        children = flow.dom_children
 
         def top(ref):
             stack = stacks.get(ref)
@@ -344,8 +228,8 @@ class _Converter:
 
             # Fill the phi of every reachable successor: current block is
             # the predecessor supplying top(ref) on this edge.
-            for successor in cfg.succs[old]:
-                if successor not in cfg.reachable:
+            for successor in flow.succs[old]:
+                if successor not in reachable:
                     continue
                 for phi in block_phis.get(successor, ()):
                     phi.entries[new] = use(phi_origin[phi])
@@ -360,7 +244,7 @@ class _Converter:
 
         for old, new in block_map.items():
             new.phis = list(block_phis.get(old, ()))
-            if old not in cfg.reachable:
+            if old not in reachable:
                 self._clone_unreachable(old, new, block_map)
 
         new_params = [
