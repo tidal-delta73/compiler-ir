@@ -16,9 +16,9 @@ process**:
       -> target text file
       -> ``tests/target_runner.py`` in a fresh subprocess
 
-Nothing is added to or changed in the compiler package, no new public entry
-point is introduced, and no production dependency is taken (the runner and
-this module use the standard library only).  Different orders are **not**
+The existing public entry points are exercised as-is, and no production
+dependency is taken (the runner and this module use the standard library
+only).  Different orders are **not**
 required to emit byte-identical targets; they are required to produce
 targets that run identically.
 
@@ -61,14 +61,15 @@ each other:
 * ``void-entry`` -- a ``void main`` with branch-local calls, pinning the
   bare-return exit status and empty stderr.
 
-This codebase ships exactly three SSA-stage transforms -- SSA construction,
-constant folding/propagation and dead-code elimination; loop-invariant
-hoisting and inlining are not implemented passes, so nothing named "licm"
-or "inline" exists to permute.  The loop-invariant and inlineable-callee
-samples above nevertheless pin how the existing fold/DCE reorderings behave
-around those source shapes.  All schedules preserve the stage contracts:
-``to_ssa`` precedes every SSA-dependent pass (``fold``/``dce`` raise if run
-earlier), and instruction selection (``render_module``) runs last.
+This codebase ships four SSA-stage transforms -- SSA construction,
+constant folding/propagation, loop-invariant code motion (``licm``) and
+dead-code elimination; inlining is not an implemented pass, so nothing
+named "inline" exists to permute.  The inlineable-callee sample above
+nevertheless pins how the existing fold/licm/DCE reorderings behave around
+that source shape (no order inlines the call).  All schedules preserve the
+stage contracts: ``to_ssa`` precedes every SSA-dependent pass
+(``fold``/``licm``/``dce`` raise if run earlier), and instruction
+selection (``render_module``) runs last.
 
 Isolation and reproducibility
 -----------------------------
@@ -107,6 +108,7 @@ from compiler_ir import (
     UndefinedSymbolError,
     eliminate_dead_code,
     fold_constants,
+    hoist_loop_invariants,
     lower_module,
     render_module,
     to_ssa,
@@ -138,21 +140,21 @@ _RUN_TIMEOUT_SECONDS = 30
 # Pass schedules (existing public passes only; stage contracts enforced)
 # ==========================================================================
 
-DEFAULT_ORDER = ("ssa", "fold", "dce", "ssa")
+DEFAULT_ORDER = ("ssa", "fold", "licm", "dce", "ssa")
 
 # Four legal schedules that differ from the default.  The first three end
 # with the canonicalizing ssa renumbering and reach the same fixed point;
-# the last omits the trailing canonicalization, so its emitted target is
-# deliberately byte-different and must still run identically.
+# the last omits LICM and the trailing canonicalization, so its emitted
+# target is deliberately byte-different and must still run identically.
 LEGAL_ORDERS = {
-    "default ssa,fold,dce,ssa": DEFAULT_ORDER,
-    "dce-before-fold ssa,dce,fold,dce,ssa":
-        ("ssa", "dce", "fold", "dce", "ssa"),
-    "fold-dce-interleaved ssa,fold,dce,fold,dce,ssa":
-        ("ssa", "fold", "dce", "fold", "dce", "ssa"),
-    "fold-fixpoint ssa,fold,fold,dce,ssa":
-        ("ssa", "fold", "fold", "dce", "ssa"),
-    "raw-core ssa,fold,dce (no trailing canonicalization)":
+    "default ssa,fold,licm,dce,ssa": DEFAULT_ORDER,
+    "dce-before-fold ssa,dce,fold,licm,dce,ssa":
+        ("ssa", "dce", "fold", "licm", "dce", "ssa"),
+    "fold-dce-interleaved ssa,fold,dce,fold,licm,dce,ssa":
+        ("ssa", "fold", "dce", "fold", "licm", "dce", "ssa"),
+    "fold-fixpoint ssa,fold,fold,licm,dce,ssa":
+        ("ssa", "fold", "fold", "licm", "dce", "ssa"),
+    "raw-core ssa,fold,dce (no licm, no trailing canonicalization)":
         ("ssa", "fold", "dce"),
 }
 BASELINE_NAME = next(iter(LEGAL_ORDERS))
@@ -160,6 +162,7 @@ BASELINE_NAME = next(iter(LEGAL_ORDERS))
 _PASSES = {
     "ssa": to_ssa,
     "fold": fold_constants,
+    "licm": hoist_loop_invariants,
     "dce": eliminate_dead_code,
 }
 
@@ -182,7 +185,7 @@ def apply_order(module, order):
         if name == "ssa":
             module = to_ssa(module)
             ssa_seen = True
-        elif name in ("fold", "dce"):
+        elif name in ("fold", "licm", "dce"):
             if not ssa_seen:
                 raise ValueError(
                     f"pass order violates precondition: {name!r} requires "
@@ -692,7 +695,7 @@ class TargetReproducibilityTests(unittest.TestCase):
                     )
                 raw = compile_target(
                     ast, LEGAL_ORDERS[
-                        "raw-core ssa,fold,dce (no trailing "
+                        "raw-core ssa,fold,dce (no licm, no trailing "
                         "canonicalization)"])
                 # The void sample may legitimately coincide textually once
                 # numbering happens to match; require at least most corpus
@@ -701,8 +704,9 @@ class TargetReproducibilityTests(unittest.TestCase):
             compile_target(builder(), DEFAULT_ORDER)
             != compile_target(
                 builder(),
-                LEGAL_ORDERS["raw-core ssa,fold,dce (no trailing "
-                             "canonicalization)"])
+                LEGAL_ORDERS[
+                        "raw-core ssa,fold,dce (no licm, no trailing "
+                        "canonicalization)"])
             for _sample, builder, _rows in _CORPUS
         )
         self.assertGreaterEqual(
@@ -725,7 +729,7 @@ class StageContractTests(unittest.TestCase):
                 msg="instruction selection must run after the whole order")
             seen_ssa = False
             for pass_name in order:
-                if pass_name in ("fold", "dce"):
+                if pass_name in ("fold", "licm", "dce"):
                     self.assertTrue(
                         seen_ssa,
                         msg=f"order {name!r}: {pass_name} precedes ssa")
@@ -751,12 +755,13 @@ class StageContractTests(unittest.TestCase):
             apply_order(lowered, ("ssa", "inline"))
 
     def test_default_order_is_the_documented_pipeline(self):
-        # The harness's default is literally to_ssa/fold/dce/to_ssa followed
-        # by rendering; no new pipeline or public entry is invented.
+        # The harness's default is literally to_ssa/fold/licm/dce/to_ssa followed
+        # by rendering through the existing public pipeline.
         ast = _loop_invariant_program()
         lowered = lower_module(copy.deepcopy(ast))
         manual = render_module(
-            to_ssa(eliminate_dead_code(fold_constants(to_ssa(lowered)))))
+            to_ssa(eliminate_dead_code(
+                hoist_loop_invariants(fold_constants(to_ssa(lowered))))))
         self.assertEqual(manual.encode("utf-8"),
                          compile_target(ast, DEFAULT_ORDER))
 

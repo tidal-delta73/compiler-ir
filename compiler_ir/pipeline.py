@@ -3,7 +3,8 @@
 The entry point :func:`optimize_module` collects into one library function
 the pass orchestration that callers previously hand-wrote around
 :func:`~compiler_ir.ssa.to_ssa`,
-:func:`~compiler_ir.folding.fold_constants` and
+:func:`~compiler_ir.folding.fold_constants`,
+:func:`~compiler_ir.licm.hoist_loop_invariants` and
 :func:`~compiler_ir.dce.eliminate_dead_code`::
 
     optimized = optimize_module(module)                     # default schedule
@@ -17,21 +18,23 @@ The accepted inputs are exactly:
 * an existing SSA :class:`Module` (for example the result of an earlier
   :func:`optimize_module` call).
 
-``passes`` is a finite sequence of the names ``"ssa"``, ``"fold"`` and
-``"dce"``; passes run in the given order and names may repeat (``ssa``
-freely, and ``fold``/``dce`` whenever the SSA stage constraint holds).
-When it is omitted, the schedule is ``("ssa", "fold", "dce", "ssa")``:
-SSA construction, constant folding, dead-code elimination, and a trailing
+``passes`` is a finite sequence of the names ``"ssa"``, ``"fold"``,
+``"licm"`` and ``"dce"``; passes run in the given order and names may
+repeat (``ssa`` freely, and ``fold``/``licm``/``dce`` whenever the SSA
+stage constraint holds).  When it is omitted, the schedule is
+``("ssa", "fold", "licm", "dce", "ssa")``: SSA construction, constant
+folding, loop-invariant code motion, dead-code elimination, and a trailing
 SSA canonicalization that renumbers away the definition holes DCE may
 leave, so the result is the fixed point of the default sequence.
 
 Stage constraint
 ----------------
 
-``fold`` and ``dce`` require an SSA module.  On a non-SSA input the first
-such name in the sequence must be preceded by an ``ssa``; an SSA input is
-already past that stage, so it may start directly with ``fold`` or ``dce``
-(an explicit ``ssa`` then merely re-canonicalizes the numbering).
+``fold``, ``licm`` and ``dce`` require an SSA module.  On a non-SSA input
+the first such name in the sequence must be preceded by an ``ssa``; an SSA
+input is already past that stage, so it may start directly with ``fold``,
+``licm`` or ``dce`` (an explicit ``ssa`` then merely re-canonicalizes the
+numbering).
 :func:`~compiler_ir.printer.render_module` is not an optimization and is
 never part of a schedule -- it is reported as an unknown name.
 
@@ -48,9 +51,9 @@ module is never mutated and shares no mutable container with the result.
 Validation happens *before* any pass runs.  A non-:class:`Module`
 ``module`` raises :class:`TypeError`; ``passes`` given as a single string
 or any non-sequence, or containing non-string elements, raises
-:class:`TypeError`; unknown pass names and ``fold``/``dce`` scheduled
-before the first SSA stage on a non-SSA input raise :class:`ValueError`.
-A rejected call leaves the input module unchanged.
+:class:`TypeError`; unknown pass names and ``fold``/``licm``/``dce``
+scheduled before the first SSA stage on a non-SSA input raise
+:class:`ValueError`.  A rejected call leaves the input module unchanged.
 """
 from collections.abc import Sequence
 
@@ -70,22 +73,24 @@ from .ir_nodes import (
     Phi,
     Return,
 )
+from .licm import hoist_loop_invariants
 from .ssa import to_ssa
 
 #: Pass names that may appear in an explicit schedule.
-PASS_NAMES = ("ssa", "fold", "dce")
+PASS_NAMES = ("ssa", "fold", "licm", "dce")
 
 #: Schedule used when ``passes`` is omitted.
-DEFAULT_PASSES = ("ssa", "fold", "dce", "ssa")
+DEFAULT_PASSES = ("ssa", "fold", "licm", "dce", "ssa")
 
 _PASS_FUNCS = {
     "ssa": to_ssa,
     "fold": fold_constants,
+    "licm": hoist_loop_invariants,
     "dce": eliminate_dead_code,
 }
 
 #: Names whose stage precondition is an SSA module.
-_SSA_DEPENDENT = frozenset(("fold", "dce"))
+_SSA_DEPENDENT = frozenset(("fold", "licm", "dce"))
 
 
 def optimize_module(module: Module, passes=None) -> Module:
@@ -95,9 +100,10 @@ def optimize_module(module: Module, passes=None) -> Module:
         :func:`~compiler_ir.lowerer.lower_module` or an existing SSA
         :class:`Module`.
     :param passes: an optional finite sequence of pass names drawn from
-        ``"ssa"``, ``"fold"`` and ``"dce"``.  When ``None`` (the default)
-        the schedule is ``("ssa", "fold", "dce", "ssa")``.  An empty
-        sequence returns an independent, content-equivalent copy.
+        ``"ssa"``, ``"fold"``, ``"licm"`` and ``"dce"``.  When ``None``
+        (the default) the schedule is
+        ``("ssa", "fold", "licm", "dce", "ssa")``.  An empty sequence
+        returns an independent, content-equivalent copy.
     :return: a brand new SSA :class:`Module` for any non-empty schedule;
         for an empty schedule the copy keeps the input's SSA flavor.  The
         result is traversable and renderable, and shares no mutable
@@ -106,8 +112,8 @@ def optimize_module(module: Module, passes=None) -> Module:
         ``passes`` is a string, a non-sequence, or contains non-string
         elements.
     :raises ValueError: if ``passes`` contains an unknown name (including
-        ``"render_module"``), or schedules ``fold``/``dce`` on a non-SSA
-        input before any ``ssa`` stage.
+        ``"render_module"``), or schedules ``fold``/``licm``/``dce`` on a
+        non-SSA input before any ``ssa`` stage.
     """
     if not isinstance(module, Module):
         raise TypeError(
@@ -131,7 +137,7 @@ def optimize_module(module: Module, passes=None) -> Module:
 
     # Up-front stage validation over the whole order, before any pass runs.
     # An SSA input starts past the SSA stage; a non-SSA input must meet its
-    # first fold/dce only after an ssa entry.
+    # first fold/licm/dce only after an ssa entry.
     ssa_stage = bool(getattr(module, "ssa", False))
     for name in schedule:
         if name == "ssa":

@@ -20,11 +20,12 @@ the existing public entry points and checks that:
    stop short of the canonical endpoint are only required to reach it once
    the missing normalization is applied.
 4. Orderings may only permute passes inside the existing stage contracts:
-   SSA construction precedes every SSA-dependent optimization (folding and
-   DCE), and instruction selection (the deterministic
-   :func:`render_module` emission) runs after IR optimization.
+   SSA construction precedes every SSA-dependent optimization (folding,
+   loop-invariant code motion and DCE), and instruction selection (the
+   deterministic :func:`render_module` emission) runs after IR
+   optimization.
 
-Passes and preconditions (nothing new is added to the compiler package)
+Passes and preconditions
 -----------------------------------------------------------------------
 
 * ``ssa``  -- :func:`to_ssa`.  Legal on a lowered module and, as an
@@ -35,23 +36,28 @@ Passes and preconditions (nothing new is added to the compiler package)
   purely rewrite-in-place in the SSA slots (folded BinOps/phis become
   ``Const`` definitions) and never deletes a definition, a block or a call,
   and never turns a constant ``Branch`` into a ``Jump``.
+* ``licm`` -- :func:`hoist_loop_invariants`.  SSA-only as well: applying
+  it before ``ssa`` raises ``ValueError``.  Only ``Const`` and pure
+  ``add``/``sub``/``mul``/comparison definitions with loop-external (or
+  just-hoisted) operands move out of suitably shaped natural loops;
+  ``Phi``, ``Call``, ``Copy``, ``div`` and ``mod`` stay in place, and no
+  block is created or deleted.
 * ``dce``  -- :func:`eliminate_dead_code`.  Its documented precondition is
   an SSA module: applying it before ``ssa`` raises ``ValueError``.
 * instruction selection is the final :func:`render_module` and is fixed
   last.
 
-The default optimization pipeline is ``ssa, fold, dce, ssa``: both
+The default optimization pipeline is ``ssa, fold, licm, dce, ssa``: the
 SSA-dependent optimizations sit after SSA construction, folding runs before
-DCE so that definitions made pointless by folding (folded BinOps, folded
-phis and their operands) are reclaimed in the same pipeline, and a trailing
-SSA canonicalization compacts the numbering holes DCE may leave so the
-emitted IR is the canonical fixed point of the sequence.  Alternative legal
-orders permute the middle: folding may be repeated, DCE may be repeated,
-DCE may run before folding (a following DCE is then needed to reclaim the
+LICM so its folded constants are themselves hoistable, LICM runs before DCE
+so the final layout is canonical in one pass, and a trailing SSA
+canonicalization compacts the numbering holes DCE may leave so the emitted
+IR is the canonical fixed point of the sequence.  Alternative legal orders
+permute the middle: folding may be repeated, DCE may be repeated, DCE may
+run before folding (a following DCE is then needed to reclaim the
 definitions folding exposes), and fold/DCE may interleave.  Orders without
-DCE (``ssa`` and ``ssa, fold``) and the un-canonicalized raw cores
-(``ssa, fold, dce`` and ``ssa, dce, fold``) are legal as well; their text
-may differ while their observable behavior must not.
+LICM or DCE (``ssa``, ``ssa, fold`` and the raw cores) are legal as well;
+their text may differ while their observable behavior must not.
 
 Observables
 -----------
@@ -105,6 +111,7 @@ from compiler_ir import (
     UndefinedSymbolError,
     eliminate_dead_code,
     fold_constants,
+    hoist_loop_invariants,
     lower_module,
     render_module,
     to_ssa,
@@ -459,43 +466,47 @@ def _interpret(module: Module, entry: str, arguments) -> Outcome:
 # ==========================================================================
 
 
-# SSA construction, constant folding, DCE, then a final SSA
-# canonicalization (clone + deterministic renumbering), which makes the
-# emitted IR the fixed point of the whole sequence: DCE may leave numbering
-# holes, and the trailing ssa pass compacts them without changing
-# structure or semantics.  Folding precedes DCE on purpose so folding's
-# newly dead definitions are reclaimed in the same pipeline.
-DEFAULT_ORDER = ("ssa", "fold", "dce", "ssa")
+# SSA construction, constant folding, loop-invariant code motion, DCE, then
+# a final SSA canonicalization (clone + deterministic renumbering), which
+# makes the emitted IR the fixed point of the whole sequence: DCE may leave
+# numbering holes, and the trailing ssa pass compacts them without changing
+# structure or semantics.  Folding precedes LICM so its folded constants
+# are themselves recognized as invariants; LICM precedes DCE so definitions
+# DCE deletes and hoisted definitions share one canonical layout.
+DEFAULT_ORDER = ("ssa", "fold", "licm", "dce", "ssa")
 
 # Legal alternatives: an explicit fold fixpoint repeat, an explicit DCE
 # fixpoint repeat, DCE-before-fold (a second DCE reclaims what folding
-# exposes), and a fold/dce interleaving -- all end in the canonicalizing
-# ssa pass, so each is a fixed point of its own sequence.
-ALT_FOLD_FIXPOINT = ("ssa", "fold", "fold", "dce", "ssa")
-ALT_DCE_FIXPOINT = ("ssa", "fold", "dce", "dce", "ssa")
-ALT_DCE_BEFORE_FOLD = ("ssa", "dce", "fold", "dce", "ssa")
-ALT_INTERLEAVE = ("ssa", "fold", "dce", "fold", "dce", "ssa")
+# exposes), and a fold/dce interleaving -- all run LICM in its canonical
+# slot and end in the canonicalizing ssa pass, so each is a fixed point of
+# its own sequence.
+ALT_FOLD_FIXPOINT = ("ssa", "fold", "fold", "licm", "dce", "ssa")
+ALT_DCE_FIXPOINT = ("ssa", "fold", "licm", "dce", "dce", "ssa")
+ALT_DCE_BEFORE_FOLD = ("ssa", "dce", "fold", "licm", "dce", "ssa")
+ALT_INTERLEAVE = ("ssa", "fold", "dce", "fold", "licm", "dce", "ssa")
 # Legal but less optimizing: construction (+ canonicalization) only, or
 # folding without any DCE: folded text coexists with the now-unused
 # definitions, which is a different text shape with identical behavior.
 NO_DCE_ORDER = ("ssa",)
 FOLD_NO_DCE_ORDER = ("ssa", "fold")
-# README-style raw cores without the trailing canonicalization: legal,
-# used for cross-order semantics and determinism (their endpoints may
-# carry numbering holes and are compared on observables, not text).
+# Raw cores without LICM and/or the trailing canonicalization: legal, used
+# for cross-order semantics and determinism (their endpoints may carry
+# numbering holes and are compared on observables, not text).
 RAW_FOLD_DCE_ORDER = ("ssa", "fold", "dce")
 RAW_DCE_FOLD_ORDER = ("ssa", "dce", "fold")
+RAW_LICM_ORDER = ("ssa", "fold", "licm")
 
 LEGAL_ORDERS = {
-    "default ssa,fold,dce,ssa": DEFAULT_ORDER,
-    "alt ssa,fold,fold,dce,ssa": ALT_FOLD_FIXPOINT,
-    "alt ssa,fold,dce,dce,ssa": ALT_DCE_FIXPOINT,
-    "alt ssa,dce,fold,dce,ssa": ALT_DCE_BEFORE_FOLD,
-    "alt ssa,fold,dce,fold,dce,ssa": ALT_INTERLEAVE,
+    "default ssa,fold,licm,dce,ssa": DEFAULT_ORDER,
+    "alt ssa,fold,fold,licm,dce,ssa": ALT_FOLD_FIXPOINT,
+    "alt ssa,fold,licm,dce,dce,ssa": ALT_DCE_FIXPOINT,
+    "alt ssa,dce,fold,licm,dce,ssa": ALT_DCE_BEFORE_FOLD,
+    "alt ssa,fold,dce,fold,licm,dce,ssa": ALT_INTERLEAVE,
     "no-dce ssa": NO_DCE_ORDER,
     "fold-no-dce ssa,fold": FOLD_NO_DCE_ORDER,
     "raw core ssa,fold,dce": RAW_FOLD_DCE_ORDER,
     "raw core ssa,dce,fold": RAW_DCE_FOLD_ORDER,
+    "raw core ssa,fold,licm": RAW_LICM_ORDER,
 }
 
 # Orders whose endpoint is the canonical fixed point used by the strict
@@ -505,10 +516,11 @@ CANONICAL_ORDERS = {
     if name.startswith(("default", "alt"))
 }
 
-_SSA_DEPENDENT = {"fold", "dce"}
+_SSA_DEPENDENT = {"fold", "licm", "dce"}
 _PASS_FUNCS = {
     "ssa": to_ssa,
     "fold": fold_constants,
+    "licm": hoist_loop_invariants,
     "dce": eliminate_dead_code,
 }
 
@@ -517,8 +529,8 @@ def apply_order(module: Module, order) -> Module:
     """Apply ``order`` (a tuple of pass names) to ``module``.
 
     :raises ValueError: if a pass name is unknown, if instruction selection
-        appears anywhere but the end, or if ``fold``/``dce`` is scheduled
-        before the first ``ssa`` (both require an SSA module).
+        appears anywhere but the end, or if ``fold``/``licm``/``dce`` is
+        scheduled before the first ``ssa`` (all require an SSA module).
     """
     ssa_seen = bool(getattr(module, "ssa", False))
     for name in order:
@@ -1290,11 +1302,13 @@ class IdempotenceTests(unittest.TestCase):
         # missing fold/DCE/renumbering is applied; the endpoint is then
         # stable under the full canonical sequence.
         completions = {
-            "no-dce ssa": ("fold", "dce", "ssa"),
-            "fold-no-dce ssa,fold": ("dce", "ssa"),
-            "raw core ssa,fold,dce": ("ssa",),
+            "no-dce ssa": ("fold", "licm", "dce", "ssa"),
+            "fold-no-dce ssa,fold": ("licm", "dce", "ssa"),
+            "raw core ssa,fold,dce": ("licm", "ssa"),
             # ssa,dce,fold still owns the definitions folding made dead.
-            "raw core ssa,dce,fold": ("dce", "ssa"),
+            "raw core ssa,dce,fold": ("licm", "dce", "ssa"),
+            # ssa,fold,licm only misses DCE and the trailing renumbering.
+            "raw core ssa,fold,licm": ("dce", "ssa"),
         }
         for label, builder, _entry, _args, _pin in _CASES:
             ast = builder()
@@ -1364,6 +1378,16 @@ class PassOrderPreconditionTests(unittest.TestCase):
         # The pass itself enforces the same precondition directly.
         with self.assertRaises(ValueError):
             eliminate_dead_code(lowered)
+
+    def test_licm_before_ssa_is_rejected(self):
+        lowered = lower_module(_clean_program())
+        with self.assertRaises(ValueError):
+            apply_order(lowered, ("licm",))
+        with self.assertRaises(ValueError):
+            apply_order(lowered, ("licm", "fold", "ssa"))
+        # The pass itself enforces the same precondition directly.
+        with self.assertRaises(ValueError):
+            hoist_loop_invariants(lowered)
 
     def test_fold_before_ssa_is_rejected(self):
         lowered = lower_module(_clean_program())
@@ -1654,9 +1678,21 @@ class PassInteractionShapeTests(unittest.TestCase):
                 if "fold" in order:
                     # The loop-invariant 1 + 5 folded; only i + 6 remains.
                     self.assertEqual(len(body_adds), 1)
-                    self.assertIn(6, [
-                        i.value for i in blocks["b2"].instructions
-                        if isinstance(i, Const)])
+                    if "licm" in order:
+                        # The folded Const 6 is itself loop invariant and is
+                        # hoisted ahead of the loop header.
+                        body_consts = [
+                            i.value for i in blocks["b2"].instructions
+                            if isinstance(i, Const)]
+                        self.assertNotIn(6, body_consts)
+                        preheader_consts = [
+                            i.value for i in blocks["b0"].instructions
+                            if isinstance(i, Const)]
+                        self.assertIn(6, preheader_consts)
+                    else:
+                        self.assertIn(6, [
+                            i.value for i in blocks["b2"].instructions
+                            if isinstance(i, Const)])
                 else:
                     self.assertEqual(len(body_adds), 2)
 

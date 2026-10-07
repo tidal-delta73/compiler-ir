@@ -12,8 +12,9 @@ The single-entry driver is pinned on five contracts:
    the empty schedule and even for the empty module; an empty schedule
    preserves the input's SSA/non-SSA flavor.
 3. Orchestration -- omitted ``passes`` is exactly
-   ``ssa, fold, dce, ssa`` (the hand-written chain renders byte-identically)
-   and explicit schedules execute their names in order with repeats.
+   ``ssa, fold, licm, dce, ssa`` (the hand-written chain renders
+   byte-identically) and explicit schedules execute their names in order
+   with repeats.
 4. Determinism / idempotence -- repeated calls and re-applying the default
    schedule give structurally and textually identical modules.
 5. Semantics -- across legal schedules (including SSA-input schedules that
@@ -29,6 +30,7 @@ from compiler_ir import (
     eliminate_dead_code,
     emit_ir,
     fold_constants,
+    hoist_loop_invariants,
     lower_module,
     optimize_module,
     render_module,
@@ -51,31 +53,36 @@ from test_dce import _container_objects
 # Explicit schedules exercised from a *non-SSA* input.
 NON_SSA_ORDERS = [
     DEFAULT_ORDER,
-    ("ssa", "fold", "fold", "dce", "ssa"),
-    ("ssa", "fold", "dce", "dce", "ssa"),
-    ("ssa", "dce", "fold", "dce", "ssa"),
-    ("ssa", "fold", "dce", "fold", "dce", "ssa"),
+    ("ssa", "fold", "fold", "licm", "dce", "ssa"),
+    ("ssa", "fold", "licm", "dce", "dce", "ssa"),
+    ("ssa", "dce", "fold", "licm", "dce", "ssa"),
+    ("ssa", "fold", "dce", "fold", "licm", "dce", "ssa"),
     ("ssa",),
     ("ssa", "fold"),
     ("ssa", "dce"),
     ("ssa", "fold", "dce"),
     ("ssa", "dce", "fold"),
-    ("ssa", "ssa", "fold", "dce", "ssa"),
-    ("ssa", "fold", "ssa", "dce", "ssa"),
+    ("ssa", "fold", "licm"),
+    ("ssa", "licm"),
+    ("ssa", "ssa", "fold", "licm", "dce", "ssa"),
+    ("ssa", "fold", "ssa", "licm", "dce", "ssa"),
+    ("ssa", "fold", "licm", "licm", "dce", "ssa"),
 ]
 
-# Schedules exercised from an already-SSA input: fold/dce may lead, ssa may
-# re-canonicalize, names may repeat.
+# Schedules exercised from an already-SSA input: fold/licm/dce may lead,
+# ssa may re-canonicalize, names may repeat.
 SSA_ORDERS = [
     None,
-    ("fold", "dce", "ssa"),
+    ("fold", "licm", "dce", "ssa"),
     ("fold",),
     ("dce",),
+    ("licm",),
     ("ssa",),
-    ("dce", "fold", "dce", "ssa"),
+    ("dce", "fold", "licm", "dce", "ssa"),
     ("fold", "fold", "dce"),
+    ("licm", "licm"),
     ("dce", "dce"),
-    ("ssa", "fold", "dce", "ssa"),
+    ("ssa", "fold", "licm", "dce", "ssa"),
     (),
 ]
 
@@ -148,16 +155,18 @@ class OptimizeValidationTests(unittest.TestCase):
                                            "render_module"))
 
     def test_fold_dce_before_ssa_rejected_on_non_ssa_input(self):
-        for order in (("fold",), ("dce",),
+        for order in (("fold",), ("dce",), ("licm",),
                       ("fold", "ssa"), ("dce", "fold", "ssa"),
+                      ("licm", "fold", "ssa"),
                       ("fold", "dce"), ("dce", "dce"),
-                      ("fold", "dce", "ssa")):
+                      ("fold", "licm", "dce", "ssa")):
             with self.subTest(order=order):
                 with self.assertRaises(ValueError):
                     optimize_module(self.lowered, order)
 
-    def test_ssa_input_may_start_with_fold_or_dce(self):
-        for order in (("fold",), ("dce",), ("fold", "dce", "ssa"),
+    def test_ssa_input_may_start_with_fold_licm_or_dce(self):
+        for order in (("fold",), ("dce",), ("licm",),
+                      ("fold", "licm", "dce", "ssa"),
                       ("dce", "fold"), ()):
             with self.subTest(order=order):
                 optimize_module(self.ssa, order)  # must not raise
@@ -256,7 +265,7 @@ class OptimizeIndependenceTests(unittest.TestCase):
     def test_empty_module_every_schedule(self):
         for ssa_flag, order in ((False, ()), (True, ()), (True, None),
                                (True, ("fold",)), (True, ("dce",)),
-                               (True, ("ssa",))):
+                               (True, ("licm",)), (True, ("ssa",))):
             empty = Module([], ssa=ssa_flag)
             result = optimize_module(empty, order)
             with self.subTest(ssa=ssa_flag, order=order):
@@ -292,7 +301,9 @@ class OptimizeOrchestrationTests(unittest.TestCase):
             lowered = _lowered(builder)
             driven = optimize_module(lowered)
             manual = to_ssa(
-                eliminate_dead_code(fold_constants(to_ssa(lowered))))
+                eliminate_dead_code(
+                    hoist_loop_invariants(
+                        fold_constants(to_ssa(lowered)))))
             with self.subTest(builder=builder.__name__):
                 self.assertEqual(render_module(driven), render_module(manual))
                 self.assertEqual(
@@ -442,6 +453,19 @@ class ExistingSurfaceTests(unittest.TestCase):
 
         self.assertIn("optimize_module", compiler_ir.__all__)
         self.assertIs(compiler_ir.optimize_module, optimize_module)
+
+    def test_hoist_loop_invariants_is_public(self):
+        import compiler_ir
+
+        self.assertIn("hoist_loop_invariants", compiler_ir.__all__)
+        self.assertIs(
+            compiler_ir.hoist_loop_invariants, hoist_loop_invariants)
+        self.assertIn("licm", optimize_module.__doc__ + "")
+        from compiler_ir.pipeline import DEFAULT_PASSES, PASS_NAMES
+
+        self.assertEqual(
+            DEFAULT_PASSES, ("ssa", "fold", "licm", "dce", "ssa"))
+        self.assertIn("licm", PASS_NAMES)
 
     def test_emit_ir_remains_unoptimized_lowering(self):
         from test_pipeline import arith, int_, let

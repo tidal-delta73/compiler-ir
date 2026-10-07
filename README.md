@@ -195,6 +195,56 @@ labels and order, terminators, phi order, instruction relative order and
 all existing SSA numbers are preserved; repeated calls on the same input
 give a structural and textual fixed point.
 
+## Loop-invariant code motion
+
+`hoist_loop_invariants` takes an SSA `Module` produced by `to_ssa` and
+returns a brand new SSA `Module` in which safe, loop-invariant
+instructions are moved out of their loops; the input is never mutated and
+the result shares no mutable function, block, instruction or phi
+container with it. A non-`Module` object raises `TypeError`; a non-SSA
+`Module` raises `ValueError`. The empty module and modules without a
+hoistable loop return independent, content-equivalent copies.
+
+```python
+from compiler_ir import (
+    lower_module, to_ssa, fold_constants,
+    hoist_loop_invariants, render_module,
+)
+
+ssa = to_ssa(lower_module(ast))
+hoisted = hoist_loop_invariants(ssa)   # new Module; ssa is left untouched
+print(render_module(hoisted))
+```
+
+Every reachable *natural loop* (a header plus the blocks of a back edge
+into it) is considered, but code moves only when the loop has the exact
+shape that makes the move unconditionally safe:
+
+* the header has exactly one loop-external predecessor;
+* that predecessor branches only to the header.
+
+Loops not meeting this shape are left exactly as they are, no new basic
+block is created, and multiple back edges into one header share one
+natural loop. Only these definitions are hoisted, into the unique
+external predecessor immediately before its terminator:
+
+* `const` — always invariant;
+* an `add`/`sub`/`mul` arithmetic `BinOp` and every comparison `BinOp`,
+  once every operand is defined outside the loop or was itself hoisted
+  in the same processing of that loop.
+
+`phi`, `call` and `copy` are never moved, and neither are `div` or `mod`:
+a zero-iteration loop must neither gain a call nor execute a
+(potentially faulting) division or remainder before the loop is even
+entered. Nested loops are handled inner first, so an invariant of several
+loops travels to the outermost eligible predecessor in one pass; each
+instruction physically moves once, keeping the relative order given by
+the original block and instruction order. Function order, signatures,
+parameters, block labels and order, terminators, phi nodes, and the
+existing SSA numbers are all preserved — moved instructions keep their
+own value slot, so no operand is rewritten. Repeated calls on the same
+input give a structural and textual fixed point.
+
 ## Optimization pipeline
 
 `optimize_module(module, passes=None)` collects the pass orchestration
@@ -208,24 +258,25 @@ instruction or phi container is reused, and no text is rendered.
 from compiler_ir import lower_module, optimize_module, render_module
 
 lowered = lower_module(ast)
-optimized = optimize_module(lowered)            # ("ssa","fold","dce","ssa")
+optimized = optimize_module(lowered)            # ("ssa","fold","licm","dce","ssa")
 again     = optimize_module(optimized)          # idempotent re-application
 print(render_module(optimized))
 
 optimize_module(lowered, ("ssa", "fold"))       # explicit order
 optimize_module(lowered, ())                    # independent copy, non-SSA
-optimize_module(optimized, ("fold", "dce"))     # SSA input may start at fold
+optimize_module(optimized, ("fold", "licm", "dce"))  # SSA input may start at fold
 ```
 
-With `passes` omitted the schedule is `ssa, fold, dce, ssa`: SSA
-construction, folding, DCE, then a trailing SSA canonicalization that
-renumbers away the definition holes DCE may leave, making the result the
-fixed point of the default sequence. An explicit `passes` is a finite
-sequence of the names `"ssa"`, `"fold"` and `"dce"`, executed in the
-given order; names may repeat (`"ssa"` freely, `"fold"`/`"dce"` whenever
-the SSA stage constraint holds). An empty sequence performs no
-optimization and returns an independent, content-equivalent copy that
-keeps the input's SSA/non-SSA flavor.
+With `passes` omitted the schedule is `ssa, fold, licm, dce, ssa`: SSA
+construction, folding, loop-invariant code motion, DCE, then a trailing
+SSA canonicalization that renumbers away the definition holes DCE may
+leave, making the result the fixed point of the default sequence. An
+explicit `passes` is a finite sequence of the names `"ssa"`, `"fold"`,
+`"licm"` and `"dce"`, executed in the given order; names may repeat
+(`"ssa"` freely, `"fold"`/`"licm"`/`"dce"` whenever the SSA stage
+constraint holds). An empty sequence performs no optimization and returns
+an independent, content-equivalent copy that keeps the input's
+SSA/non-SSA flavor.
 
 All arguments and the whole order are validated before any pass runs:
 
@@ -234,9 +285,9 @@ All arguments and the whole order are validated before any pass runs:
   non-string element, raises `TypeError`;
 * an unknown name raises `ValueError` — `render_module` is not an
   optimizable pass and is reported as unknown;
-* on a non-SSA input, scheduling `fold`/`dce` before the first `ssa`
-  raises `ValueError`. An SSA input may begin directly with `fold` or
-  `dce`; `ssa` re-canonicalizes its numbering.
+* on a non-SSA input, scheduling `fold`/`licm`/`dce` before the first
+  `ssa` raises `ValueError`. An SSA input may begin directly with `fold`,
+  `licm` or `dce`; `ssa` re-canonicalizes its numbering.
 
 A rejected call leaves the input module unchanged. Different legal
 orders need not produce the same instruction count, SSA numbering or
